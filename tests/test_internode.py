@@ -16,9 +16,28 @@ import test_low_latency
 def test_main(args: argparse.Namespace, num_sms: int,
               local_rank: int, num_local_ranks: int, num_ranks: int, num_nodes: int, rank: int,
               buffer: deep_ep.Buffer, group: dist.ProcessGroup):
+    
+    """
+        refer: https://zhuanlan.zhihu.com/p/1890067712996270654
+        num_sms(20)
+        num_ranks(64) world_size
+        num_nodes(8) 总结点数
+        local_rank 当前Node上 gpu/rank idx
+        rank = node*8 + local_rank， global rank idx 
+    """
+
     # Settings
     num_tokens, hidden = args.num_tokens, args.hidden
+    """
+        num_tokens 4096
+        hidden 7168
+    """
     num_topk_groups, num_topk, num_experts = args.num_topk_groups, args.num_topk, args.num_experts
+    """
+        num_topk_groups(4), per token发给4台机器， Deepseek V3技术文档中提到为了减小通信，token只会发送到最多4台机器上
+        num_topk(8) 发送给4台机器中的top 8 专家
+        num_experts(256) 
+    """
 
     assert num_experts % num_ranks == 0 and num_local_ranks == 8
     if local_rank == 0:
@@ -30,24 +49,72 @@ def test_main(args: argparse.Namespace, num_sms: int,
     x_e4m3 = per_token_cast_to_fp8(x)
     x_e4m3 = (x_e4m3[0], x_e4m3[1].T.contiguous().T)
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
-    group_scores = scores.view(num_tokens, num_nodes, -1).amax(dim=-1)
+    group_scores = scores.view(num_tokens, num_nodes, -1).amax(dim=-1) 
     group_idx = torch.topk(group_scores, k=num_topk_groups, dim=-1, sorted=False).indices
+    """
+        scores  [ntokens, nexperts] 
+        group_scores [ntokens, nnodes, nexperts//nnodes]， per node 上最大score  --> [ntokens, nnodes]
+        group_idx， 从上述group_scores[ntokens, nnodes] nnodes 维度 选 num_topk_groups(4) -> [ntokens, num_token_groups]，即 per token 将router 去的 top4 节点
+
+    """
     masked_scores = create_grouped_scores(scores, group_idx, num_nodes)
+    """
+        不在top4 group 中 score 被mask为0  
+        masked_scores[ntokens, nexperts]，只是有些值是0
+    """
     topk_idx = torch.topk(masked_scores, num_topk, dim=-1, largest=True, sorted=False)[1]
+    """
+        masked_scores[ntokens, nexperts] 在 nexperts 维度上取 top8 experts_idx， [ntokens, num_topk] 
+        torch.topk() returns tuple (values, indices) --> topk_idx[ntokens, top8_expert_idx]
+    """
     topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device='cuda') * rank
     topk_weights_pure_rand = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda')
     rank_idx = topk_idx // (num_experts // num_ranks)
     rank_idx.masked_fill_(topk_idx == -1, -1)
+    """
+        * num_experts//num_ranks : per rank 上 experts 数 (4)
+        * topk_idx // 4， 即当前 expert_id 落在哪个 rank 上，亦即其 rank_idx
+        * rank_idx [ntokens, num_ranks], e.g. ith token 的 top8_expert_idx[j] 落在哪个gpu 上[0, 64]
+    """
     inplace_unique(rank_idx, num_ranks)
+    """
+        如果某个显卡有多个expert, 则rank会重复，inplace_unique是去重了rank, 剩余位置补 -1
+    """
     rdma_rank_idx = rank_idx // num_local_ranks
+    """
+        rank 每8个一组为rdma_rank group。
+        这里判断当前 rank_idx 落在哪个 rdma_rank_idx 
+        rdma_rank_idx [ntokens, 8]，描述当前token 的 top8 experts 所在 rdma分组内的 idx
+    """
     rdma_rank_idx.masked_fill_(rank_idx == -1, -1)
     inplace_unique(rdma_rank_idx, num_nodes)
-
+    """
+        如果 top8 expert_idx 对应同一个node上的多个显卡上，则rdma_rank 会重复，inplace_unique去重,剩余位置补 -1
+    """
     # RDMA dispatch counts
     rdma_idx = topk_idx // (num_experts // num_nodes)
     rdma_idx.masked_fill_(topk_idx == -1, -1)
+    """
+        * num_experts//num_nodes : per node 上 experts 数 (32)
+        topk_idx[ntokens, top8_expert_ids] // 32 :: rdma_idx[ntokens, 8]
+        即 当前 token 的 top8_experts 所在 rdma分组的idx
+
+        rdma_idx 与 rdma_rank_idx 组成2D 的网格。
+            * rdma_idx 与 node_id 对应
+            * rdma_rank_idx 与 node 内 gpu_idx 对应
+    """
     inplace_unique(rdma_idx, num_nodes)
+    """
+        如果落在同一个node上，去重。这里是粗粒度的，并没有关心node内具体哪个gpu上
+    """
     num_rdma_token_sent = rdma_idx.ne(-1).sum().item()
+    """
+        rdma_idx[ntokens, 8]
+        .ne(-1) : creates a boolean mask of same shape [ntokens, 8], any value!= -1 set as true
+        .sum(): sum all true values and produce a scale (0-dim tensor)
+        .item(): convert 0-dim tensor to integer 
+    * num_rdma_token_sent，即在 rdma_level(节点层面)需要发送的tokens 总数
+    """
 
     # Expert meta
     num_tokens_per_expert = torch.zeros((num_experts, ), dtype=torch.int, device='cuda')
@@ -55,18 +122,38 @@ def test_main(args: argparse.Namespace, num_sms: int,
         num_tokens_per_expert[i] = (topk_idx == i).sum()
     gbl_num_tokens_per_expert = num_tokens_per_expert.clone()
     dist.all_reduce(gbl_num_tokens_per_expert, group=group)
+    """
+        topk_idx[ntokens, top8_expert_idx] 统计各个expert_id 出现的次数，即 ntokens_per_expert
+        `num_tokens_per_expert[i]` on any rank counts __local_token_selections__ for expert i
+        所以，system-level 需要 allreduce 跟新全局 num_tokens_per_expert[i]
+    """
 
     # Rank layout meta
     num_tokens_per_rank = torch.empty((num_ranks, ), dtype=torch.int, device='cuda')
     num_tokens_per_rdma_rank = torch.empty((num_nodes, ), dtype=torch.int, device='cuda')
     token_idx_in_rank = torch.full((num_ranks, num_tokens), -1, dtype=torch.long, device='cuda')
+    """
+        * num_tokens_per_rank，即 per GPU 上 tokens 数
+        * num_tokens_per_rdma_rank，即 per node 上 tokens 数
+        token_idx_in_rank [num_ranks, num_tokens] 2D matrix，每行表示一个gpu 上 tokens idx
+    """
     for i in range(num_ranks):
         num_tokens_per_rank[i] = (rank_idx == i).sum()
         token_sel = (rank_idx == i).max(dim=-1)[0]
+        """
+            rank_idx[ntokens, 64]
+            (rank_idx==i) :  [ntokens, 64]
+            .max(dim=-1), max reduction along 64-dim : [ntokens, ]
+            token_sel[ntokens] ?? WIP ... 
+        """
         count = token_sel.sum().item()
         tokens = torch.sort(token_sel.to(torch.int), descending=True)[1]
         tokens[:count] = torch.sort(tokens[:count])[0]
         token_idx_in_rank[i][tokens[:count]] = torch.arange(count, dtype=torch.long, device='cuda')
+    """
+        num_tokens_per_rank[i] 类似 num_tokens_per_expert，这里只会拿到 local num_tokens_per_rank[i]
+
+    """
     for i in range(num_nodes):
         num_tokens_per_rdma_rank[i] = (rdma_rank_idx == i).sum()
     token_idx_in_rank = token_idx_in_rank.T.contiguous().to(torch.int)
