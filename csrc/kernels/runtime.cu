@@ -52,6 +52,14 @@ int init(const std::vector<uint8_t> &root_unique_id_val, int rank, int num_ranks
     nvshmemx_set_attr_uniqueid_args(rank, num_ranks, &root_unique_id, &attr);
     nvshmemx_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID, &attr);
 
+    /*
+        通过 root_unique_id 来构建nvshmem的通信组
+        root_unique_id 是 rdma_rank=0 的 8张显卡会各自产生 unique_id, 
+        然后每台机器上的显卡使用 rdma_group = rank % 8 来获取 rdma_rank=0的8个显卡对应的第rdma_group显卡的unique id
+        也就是说，rdma_rank 分组不是同一个node中的8张gpu，而是 所有 nodes上，相同 local_gpu_id 的分组
+        然后通过nvshmemx_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID, &attr)完成网络组构建
+    */
+
     // Create sub-RDMA teams
     // NOTES: if `num_ranks <= NUM_MAX_NVL_PEERS` then only low-latency kernels are used
     if (low_latency_mode and num_ranks > NUM_MAX_NVL_PEERS) {
@@ -69,6 +77,13 @@ int init(const std::vector<uint8_t> &root_unique_id_val, int rank, int num_ranks
 void* alloc(size_t size, size_t alignment) {
     return nvshmem_align(alignment, size);
 }
+/*
+    aligned allocations for inter-node communication buffers, used for : 
+        * RDMA operations in the `internode` namepsace
+        * buffer for gpu-to-gpu communication across nodes
+        * preparing memory used fornvshmem Put/Get operations and atomics
+    * must be freed with `nvshmem_free()`
+*/
 
 void free(void* ptr) {
     nvshmem_free(ptr);

@@ -70,6 +70,12 @@ __forceinline__ __device__ int translate_dst_rdma_rank(const int dst_rdma_rank, 
 template <bool kLowLatencyMode>
 __forceinline__ __device__ void nvshmem_sync_with_same_gpu_idx(const nvshmem_team_t& rdma_team) {
     kLowLatencyMode ? void(nvshmem_sync(rdma_team)) : nvshmem_sync_all();
+    /*
+        * 用于inter-node 的同步
+        1. low-latency mode，use nvshmem_sync() to synchronize only within the current NVSHMEM team (subset of ranks)
+        2. else, Uses `nvshmem_sync_all()` for global synchronization across all ranks
+        * TODO: what's rdma_team here ? 
+    */
 }
 
 template <bool kLowLatencyMode, int kNumRDMARanks>
@@ -148,6 +154,9 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
         // Barrier
         if (thread_id == 0)
             nvshmem_sync_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
+        /*
+            sync before/after sending token counts，ensure consistent view of metadata across nodes
+        */
         __syncthreads();
 
         // NVL buffers
@@ -202,6 +211,9 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
                 nvl_send_num_tokens_per_expert.buffer(nvl_rank)[i] = nvl_reduced_num_tokens_per_expert[thread_id * num_nvl_experts + i];
         }
         barrier_block<NUM_MAX_NVL_PEERS>(barrier_signal_ptrs, nvl_rank);
+        /*
+            * 用于 intra-node 内的GPU之间同步， uses shared mem signaling for low-overhead sync 
+        */
 
         // Reduce the number of tokens per rank/expert
         EP_DEVICE_ASSERT(num_nvl_experts <= num_threads);

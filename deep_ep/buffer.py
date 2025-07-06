@@ -27,7 +27,7 @@ class Buffer:
         runtime: the C++ runtime.
     """
 
-    num_sms: int = 20
+    num_sms: int = 20 # TODO 
 
     def __init__(self, group: dist.ProcessGroup,
                  num_nvl_bytes: int = 0, num_rdma_bytes: int = 0,
@@ -48,7 +48,7 @@ class Buffer:
                 this is somehow incompatible with the hook-based overlapping.
                 Warning: PCIe connections may lead to errors due to memory ordering issues,
                 please make sure all connections are via NVLink.
-            allow_mnnvl: whether to allow MNNVL
+            allow_mnnvl: whether to allow MNNVL # multi-node nvlink
         """
         check_nvlink_connections(group)
 
@@ -60,6 +60,10 @@ class Buffer:
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
         self.runtime = deep_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode)
+        """
+            初始化，nvl_buffer，ipc_handles, barrier_signal_ptrs, 
+            通讯缓冲区， moe_counter, moe_expert_counter, moe_rdma_counter 计数器
+        """
 
         # Synchronize device IDs
         device_ids = [None, ] * self.group_size
@@ -70,6 +74,16 @@ class Buffer:
         ipc_handles = [None, ] * self.group_size
         local_ipc_handle = self.runtime.get_local_ipc_handle()
         dist.all_gather_object(ipc_handles, local_ipc_handle, group)
+        """
+            TODO: why ipc here, for what ? 
+        """
+
+        """
+            概念理解
+                * nvshmem, GPU-centric 通讯库，支持跨节点 direct gpu-to-gpu 通讯，使用 Partitioned Global Address Space(PGAS) 模式
+                * IBGDA(IB GPU Direct Async)，direct gpu memory 访问over IB, bypass CPU，需要nic支持 gpuDirect rdma feature
+                * Queue Pairs(QP), 设备间通讯channels，每个QP 都有 send/recieve queues
+        """
 
         # Synchronize NVSHMEM unique IDs
         root_unique_id = None
@@ -77,24 +91,26 @@ class Buffer:
             # Enable IBGDA 
             assert num_qps_per_rank > 0
             os.environ['NVSHMEM_DISABLE_P2P'] = '0' if allow_nvlink_for_low_latency_mode else '1'
-            os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
-            os.environ['NVSHMEM_IBGDA_NIC_HANDLER'] = 'gpu'
-            os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}'
+            os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'      # enable direct gpu-to-gpu ib 通讯
+            os.environ['NVSHMEM_IBGDA_NIC_HANDLER'] = 'gpu'  # gpu mange nic directly
+            os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}' # QPs per GPU
             # Make sure QP depth is always larger than the number of on-flight WRs, so that we can skip WQ slot check
-            os.environ['NVSHMEM_QP_DEPTH'] = '1024'
+            os.environ['NVSHMEM_QP_DEPTH'] = '1024' # Queue depth for outsanding requests 
 
+            # Memory Optimization 
             # Reduce gpu memory usage
             # 6 default teams + 1 extra team
-            os.environ['NVSHMEM_MAX_TEAMS'] = '7'
-            # Disable NVLink SHArP
-            os.environ['NVSHMEM_DISABLE_NVLS'] = '1'
-            # NOTES: NVSHMEM initialization requires at least 256 MiB
-            os.environ['NVSHMEM_CUMEM_GRANULARITY'] = f'{2 ** 29}'
+            os.environ['NVSHMEM_MAX_TEAMS'] = '7' # limit 通讯teams
+            # Disable NVLink SHArP 
+            os.environ['NVSHMEM_DISABLE_NVLS'] = '1' # disable nv sharp 聚合
+            # NOTES: NVSHMEM initialization requires at least 256 MiB 
+            os.environ['NVSHMEM_CUMEM_GRANULARITY'] = f'{2 ** 29}' # 512MB memory chunks 
 
             if not allow_mnnvl:
                 # Disable multi-node NVLink detection
                 os.environ['NVSHMEM_DISABLE_MNNVL'] = '1'
 
+            # ID Synchronization 
             # Synchronize using the root ID
             nvshmem_unique_ids = [None, ] * self.group_size
             if (low_latency_mode and self.rank == 0) or (not low_latency_mode and self.runtime.get_rdma_rank() == 0):
@@ -104,6 +120,10 @@ class Buffer:
 
         # Make CPP runtime available
         self.runtime.sync(device_ids, ipc_handles, root_unique_id)
+        """
+            Buffer.sync()，完成ipc 显存映射，建立 rdma组，分配 rdma 显存。
+            后续 Buffer(self.runtime).notify_dispatch 等都是基于 ipc 显存，rdma 显存来完成 token 传输
+        """
         assert self.runtime.is_available()
 
     @staticmethod

@@ -17,6 +17,10 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
         num_nvl_bytes(num_nvl_bytes), num_rdma_bytes(num_rdma_bytes),
         low_latency_mode(low_latency_mode),
         comm_stream(at::cuda::getStreamFromPool(true)) {
+    /*
+        * rank: rank_idx
+        * num_ranks 64
+    */
     // Metadata memory
     int64_t barrier_signal_bytes = NUM_MAX_NVL_PEERS * sizeof(int);
     int64_t buffer_ptr_bytes = NUM_MAX_NVL_PEERS * sizeof(void*);
@@ -46,38 +50,84 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
     if (num_nvl_bytes > 0) {
         // Local IPC: alloc local memory and set local IPC handles
         CUDA_CHECK(cudaMalloc(&buffer_ptrs[nvl_rank], num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes + barrier_signal_ptr_bytes));
+        /*
+            buffer_ptrs 定义为 nvlink 通讯用的buffer，总大小 = 数据区 + 屏障信号 + 缓冲区指针 + 屏障指针： 
+                * buffer data: num_nvl_bytes
+                * barrier_signal_bytes: Barrier Signals
+                * buffer_ptr_bytes: Buffer Pointers
+                * barrier_signal_ptr_bytes: Barrier Signal Pointers 
+            * 显存布局:
+            Buffer Data (num_nvl_bytes) | Barrier Signals (int数组) | Buffer指针数组 (void**) | Barrier指针数组 (int**) |
+        */
         CUDA_CHECK(cudaIpcGetMemHandle(&ipc_handles[nvl_rank], buffer_ptrs[nvl_rank]));
-        buffer_ptrs_gpu = reinterpret_cast<void**>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes + barrier_signal_bytes);
+        /*
+            创建跨进程(ipc)可访问的内存句柄 ipc_handles，其他进程可通过该handle 访问对应物理内存
+            * barrier_signals 用于实现轻量级ipc同步
+            * ipc_handles 允许进程间零拷贝显存访问
+        */
 
+        // // 缓冲区指针数组起始位置
+        buffer_ptrs_gpu = reinterpret_cast<void**>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes + barrier_signal_bytes);
         // Set barrier signals
         barrier_signal_ptrs[nvl_rank] = reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes);
+        // barrier指针数组起始位置
         barrier_signal_ptrs_gpu = reinterpret_cast<int**>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes);
 
         // No need to synchronize, will do a full device sync during `sync`
         CUDA_CHECK(cudaMemsetAsync(barrier_signal_ptrs[nvl_rank], 0, barrier_signal_bytes, comm_stream));
+        /*
+            barrier 初始化: 使用 comm_stream 流，异步清零barrier_signals
+        */
     }
 
     // Create 32 MiB workspace
     CUDA_CHECK(cudaMalloc(&workspace, NUM_WORKSPACE_BYTES));
     CUDA_CHECK(cudaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, comm_stream));
+    /*
+        分配工作空间，作为通讯缓冲区
+        * workspace 初始化：使用comm_stream流，异步清零workspace  
+    */
 
-    // MoE counter
+    // MoE counter::  MoE 全局计算器
     CUDA_CHECK(cudaMallocHost(&moe_recv_counter, sizeof(int64_t), cudaHostAllocMapped));
     CUDA_CHECK(cudaHostGetDevicePointer(&moe_recv_counter_mapped, const_cast<int*>(moe_recv_counter), 0));
     *moe_recv_counter = -1;
+    /*
+        * cudaMallocHost() 分配pinned memory(锁页内存)
+        * cudaHostAllocMapped，表示该锁页内存可在设备(device)上访问，即 GPU 可以通过一个映射地址直接访问这块主机内存
+        * cudaHostGetDevicePointer()，获取 GPU 端（设备端）访问这块主机页锁定内存的映射指针。
+            即在gpu上需要使用 moe_recv_counter_mapped 指针来访问主机上moe_recv_counter 指向的pinned-memory
+        * 初始化 -1
+    */
 
     // MoE expert-level counter
     CUDA_CHECK(cudaMallocHost(&moe_recv_expert_counter, sizeof(int) * NUM_MAX_LOCAL_EXPERTS, cudaHostAllocMapped));
     CUDA_CHECK(cudaHostGetDevicePointer(&moe_recv_expert_counter_mapped, const_cast<int*>(moe_recv_expert_counter), 0));
     for (int i = 0; i < NUM_MAX_LOCAL_EXPERTS; ++ i)
         moe_recv_expert_counter[i] = -1;
-
+    /*
+        * moe_recv_expert_counter local_专家_计算器，为其分配 4byte*NUM_MAX_LOCAL_EXPERTS(1024) 字节的锁页内存
+        * gpu上使用 moe_recv_expert_counter_mapped 指针访问该锁页内存
+        * 初始化 -1
+    */
+    
     // MoE RDMA-level counter
-    if (num_rdma_ranks > 0) {
+    if (num_rdma_ranks > 0) { // 仅在多节点时分配
         CUDA_CHECK(cudaMallocHost(&moe_recv_rdma_counter, sizeof(int), cudaHostAllocMapped));
         CUDA_CHECK(cudaHostGetDevicePointer(&moe_recv_rdma_counter_mapped, const_cast<int*>(moe_recv_rdma_counter), 0));
         *moe_recv_rdma_counter = -1;
     }
+    /*
+        * moe_recv_rdma_counter rdma_计数器，4byte 锁页内存
+        * gpu上使用moe_recv_rdma_counter_mapped访问
+        * 初始化 -1
+    */
+
+    /*
+        总结: 
+            1. 使用锁页内存
+            2. 双端口访问, both host & device 可以直接操作
+    */
 }
 
 Buffer::~Buffer() noexcept(false) {
@@ -150,6 +200,10 @@ pybind11::bytearray Buffer::get_local_nvshmem_unique_id() const {
     EP_HOST_ASSERT(rdma_rank == 0 and "Only RDMA rank 0 can get NVSHMEM unique ID");
     auto unique_id = internode::get_unique_id();
     return {reinterpret_cast<const char*>(unique_id.data()), unique_id.size()};
+    /*
+        只有 rdma_rank == 0 的进程有权限调用 get_unique_id()，生成 NVSHMEM 的共享上下文标识。类似NCCL 的 ncclGetUniqueId
+        其余进程需要通过某种方式（如 MPI_Bcast、AllGather、socket 等）获取这个 ID 才能继续初始化。
+    */
 #else
     EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
 #endif
@@ -171,7 +225,12 @@ void Buffer::sync(const std::vector<int> &device_ids,
                   const std::vector<std::optional<pybind11::bytearray>> &all_gathered_handles,
                   const std::optional<pybind11::bytearray>& root_unique_id_opt) {
     EP_HOST_ASSERT(not is_available());
-
+    /*
+        call in this way: sync(device_ids, ipc_handles, root_unique_id)
+        注意这里是 ipc 的同步，限于 intra-node 内。
+        * num_nvl_ranks(8)，per node 
+        * rdma_rank 即 node_idx 
+    */
     // Sync IPC handles
     if (num_nvl_bytes > 0) {
         EP_HOST_ASSERT(num_ranks == device_ids.size());
@@ -180,12 +239,22 @@ void Buffer::sync(const std::vector<int> &device_ids,
             EP_HOST_ASSERT(all_gathered_handles[offset + i].has_value());
             auto handle_str = std::string(all_gathered_handles[offset + i].value());
             EP_HOST_ASSERT(handle_str.size() == CUDA_IPC_HANDLE_SIZE);
+            /*
+                * offset 当前节点(rdma_rank)上 GPU_0 索引
+                * handle_str 同节点内剩余 7 张 GPU 上的 handles
+            */
             if (offset + i != rank) {
                 std::memcpy(ipc_handles[i].reserved, handle_str.c_str(), CUDA_IPC_HANDLE_SIZE);
                 CUDA_CHECK(cudaIpcOpenMemHandle(&buffer_ptrs[i], ipc_handles[i], cudaIpcMemLazyEnablePeerAccess));
                 barrier_signal_ptrs[i] = reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[i]) + num_nvl_bytes);
+                /*
+                    * 在reciever端，使用cudaIpcOpenMemHandle（&ptr, handle) 获取远程进程的内存操作句柄，
+                    并使用 buffer_ptrs[i]访问该远程进程的内存
+                    * cudaIpcMemLazyEnablePeerAccess 延时建立gpu peer access, 按需启用
+                */
             } else {
                 EP_HOST_ASSERT(std::memcmp(ipc_handles[i].reserved, handle_str.c_str(), CUDA_IPC_HANDLE_SIZE) == 0);
+                // 如果是自己(当前gpu)，验证本地 handle 一致性
             }
         }
 
@@ -196,27 +265,41 @@ void Buffer::sync(const std::vector<int> &device_ids,
     }
 
     // Sync NVSHMEM handles and allocate memory
+    /* 如果跨节点，考虑 nvshmem 
+        * root_unique_id_opt<data, size> 为 nvshmem 的共享上下文标识
+    */
 #ifndef DISABLE_NVSHMEM
     if (num_rdma_bytes > 0) {
         // Initialize NVSHMEM
         EP_HOST_ASSERT(root_unique_id_opt.has_value());
         std::vector<uint8_t> root_unique_id(root_unique_id_opt->size());
         auto root_unique_id_str = root_unique_id_opt->cast<std::string>();
+        // TODO: 为什么这些标志位，都是以 string 类型存储的 ? 
         std::memcpy(root_unique_id.data(), root_unique_id_str.c_str(), root_unique_id_opt->size());
+        /*
+            跨节点系统中，每个 rdma_rank 上都获取该 root_unique_id，即 nvshmem 的上下文
+        */
         auto nvshmem_rank = low_latency_mode ? rank : rdma_rank;
         auto num_nvshmem_ranks = low_latency_mode ? num_ranks : num_rdma_ranks;
+        /*
+            低延时模式, nvshmem_rank 为 global_gpu_rank  
+            (inter-node)高吞吐模式，nvshmem_rank 为 rdma_rank(节点rank)
+        */
         EP_HOST_ASSERT(nvshmem_rank == internode::init(root_unique_id, nvshmem_rank, num_nvshmem_ranks, low_latency_mode));
-        internode::barrier();
-
+        internode::barrier(); // 等待所有进程初始化ready
+        // 全体shnvmem 进程的同步barrier，即所有进程在地等待(barrier)，直到多节点内所有进程完成 nvshmem 初始化。
         // Allocate
+        /*
+        分配 rdma 显存，每个rank节点会分配一块显存用于nvshmem通信, 在一个rdma group内， 可以通过nvshmem api访问远端的rdma_buffer。
+        */
         rdma_buffer_ptr = internode::alloc(num_rdma_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
 
         // Clean buffer (mainly for low-latency mode)
         CUDA_CHECK(cudaMemset(rdma_buffer_ptr, 0, num_rdma_bytes));
 
-        // Barrier
-        internode::barrier();
-        CUDA_CHECK(cudaDeviceSynchronize());
+        // Barrier，等待所有进程的cudaMemset() 完成
+        internode::barrier(); // rdma-rank-level 同步
+        CUDA_CHECK(cudaDeviceSynchronize()); // device-level 同步
     }
 #endif
 
@@ -650,7 +733,44 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
     // unless we release GIL here.
     pybind11::gil_scoped_release release;
 
-    const int num_channels = config.num_sms / 2;
+    /*
+        概览
+        * phase-1  metadata 同步
+            *  non-cached mode
+                * nodes exchange token counts per expert/rank through `internode::notify_dispatch()`
+                * gpu kernels write metadata to pinned host mem (moe_recv_counter*)
+                * cpu busy-waits for counters from all nodes with timeout
+                * creates prefix matrics for RDMA and global communication channels 
+            * cached mode
+                * skip metadata exchange with precomputed matrics from previous run
+                * only executes nvshmem barrier for sync 
+        * phase-2, buffer 准备
+            * allocate receiver_side tensors based on 同步后的counters
+                1. recv_x for feature data
+                2. recv_topk_* for expert routing info 
+                3. prefix matrices for RDMA and global communication 
+        * phase-3: 数据交换, using nvshmem rdma ops for bulk data transfer 
+                1. split data into chunks matching rdma buffer size
+                2. employ double-buffering for overlap 
+                3. use cuda-aware communication with `comm_stream` 
+                4. 2 parall paths:
+                        * rdma_path for inter-node communication
+                        * nvlink_path for intra-node communication 
+        * phase-4, pipeline 同步
+                * mange cuda stream dependencies
+                * records completion events if async 
+                * handles tensor lifetime through record_stream 
+                * implements producer-consumer patterns using prefix sums 
+    
+    特点总结：
+        1. chunking data for rdma transfer 
+        2. 通讯_stream overlap 计算_stream
+        3. cached metadata 
+        4. zero-copy， 使用锁页内存用于 cpu-gpu 同步
+        5. 负载平衡，将 channels 分布到多个 SMs 
+    */
+
+    const int num_channels = config.num_sms / 2;  // TODO: why 10 
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
     EP_HOST_ASSERT(0 < get_num_rdma_ranks() and get_num_rdma_ranks() <= NUM_MAX_RDMA_PEERS);
 
@@ -701,6 +821,9 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
     }
 
     auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1)), hidden_int4 = static_cast<int>(x.size(1) * x.element_size() / sizeof(int4));
+    /*
+        hidden_int4 以  4x32bit, 即 128bit 对齐 用于 数据传输
+    */
     auto num_experts = cached_mode ? 0 : static_cast<int>(num_tokens_per_expert->size(0)), num_local_experts = num_experts / num_ranks;
 
     // Top-k checks
@@ -736,17 +859,21 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
 
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
+    auto compute_stream = at::cuda::getCurrentCUDAStream(); // 获取当前流(compute)
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() and async);
         at::cuda::setCurrentCUDAStream(comm_stream);
     }
+    /*
+        如果启用了 comm_stream，则把当前流切换到 comm_stream。
+        要在comm_stream 上做tensor分配、搬运，需要先切换到comm_stream
+    */
 
     // Wait previous tasks to be finished
     if (previous_event.has_value()) {
-        stream_wait(comm_stream, previous_event.value());
+        stream_wait(comm_stream, previous_event.value()); // wait on custom event 
     } else {
-        stream_wait(comm_stream, compute_stream);
+        stream_wait(comm_stream, compute_stream);  // wait on default stream 
     }
 
     // Create handles (only return for non-cached mode)
@@ -780,11 +907,23 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
         recv_rdma_rank_prefix_sum = torch::empty({num_rdma_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
         gbl_channel_prefix_matrix = torch::empty({num_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
         recv_gbl_rank_prefix_sum = torch::empty({num_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
+        /*
+            * rdma_channel_prefix_matrix，per rdma_rank 到per channel的prefix-sum，用于标记每个rdma_rank 上每个channel 的起始位置
+            * recv_rdma_rank_prefix_sum，rdma rank 接收到的 token 数目的prefix-sum，前后差值可以标记每个 rdma_rank 上接收的tokens 数
+            * gbl_channel_prefix_matrix per rank 到 per channel 映射的prefix-sum,用于标记每个 rank 上 channel 的起始位置
+            * recv_gbl_rank_prefix_sum, global_ranks 接收到 tokens 数目的 prefix_sum，用于标记per gbl_rank 上接收的 tokens 数
+        */
 
         // Send sizes
+        // counter 初始化
         *moe_recv_counter = -1, *moe_recv_rdma_counter = -1;
         for (int i = 0; i < num_local_experts; ++ i)
-            moe_recv_expert_counter[i] = -1;
+            moe_recv_expert_counter[i] = -1;  
+        /*
+            * moe_recv_counter， 当前rank/gpu 接收的 token 数 
+            * moe_recv_rdma_counter, 当前 rdma_group 接收的 tokens 数
+            * moe_recv_expert_counter[]， per experts 接收的 tokens 数
+        */
         internode::notify_dispatch(num_tokens_per_rank->data_ptr<int>(), moe_recv_counter_mapped, num_ranks,
                                    num_tokens_per_rdma_rank->data_ptr<int>(), moe_recv_rdma_counter_mapped,
                                    num_tokens_per_expert->data_ptr<int>(), moe_recv_expert_counter_mapped, num_experts,
@@ -798,8 +937,15 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                                    config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
                                    num_nvl_bytes, low_latency_mode);
 
-        // Synchronize total received tokens and tokens per expert
+        /*
+            notify_dispatch():
+                1. how many tokens each expert should receive 
+                2. rdma channel token distribution 
+                * write results to mapped host mem
+        */
+                                   // Synchronize total received tokens and tokens per expert
         auto start_time = std::chrono::high_resolution_clock::now();
+        // cpu 轮询等待 moe_recv_coutner, moe_revc_rdma_counter 完成
         while (true) {
             // Read total count
             num_recv_tokens = static_cast<int>(*moe_recv_counter);
@@ -821,7 +967,7 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                 throw std::runtime_error("DeepEP error: timeout (dispatch CPU)");
             }
         }
-        num_recv_tokens_per_expert_list = std::vector<int>(moe_recv_expert_counter, moe_recv_expert_counter + num_local_experts);
+        num_recv_tokens_per_expert_list = std::vector<int>(moe_recv_expert_counter, moe_recv_expert_counter + num_local_experts); // 
     }
 
     // Allocate new tensors

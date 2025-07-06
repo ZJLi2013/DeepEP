@@ -137,32 +137,65 @@ def test_main(args: argparse.Namespace, num_sms: int,
         * num_tokens_per_rdma_rank，即 per node 上 tokens 数
         token_idx_in_rank [num_ranks, num_tokens] 2D matrix，每行表示一个gpu 上 tokens idx
     """
+
+    # token selection process 
     for i in range(num_ranks):
+        """
+            这个loop 是 per-rank(GPU) 上的执行，即 rank 视角，to builds a dispatch layout matrix
+            每个rank上都维护相同的全局 token_idx_in_rank， 但per rank 仅仅负责填充其所拥有experts 要处理的 token_ids
+            token_sel 是每个 rank_idx(gpu) 维护的一个本地数组，即每个gpu上都有这样一个数组于用于表示 token_ith 是否需要向该gpu 发送数据
+        """
         num_tokens_per_rank[i] = (rank_idx == i).sum()
         token_sel = (rank_idx == i).max(dim=-1)[0]
         """
-            rank_idx[ntokens, 64]
-            (rank_idx==i) :  [ntokens, 64]
-            .max(dim=-1), max reduction along 64-dim : [ntokens, ]
-            token_sel[ntokens] ?? WIP ... 
+        * token_sel as temporary tensor created/destroyed each iteration， only persist during this iteration
+            rank_idx[ntokens, 64]， 当前token 的top8 experts 所在 64x GPU 上的位置
+            (rank_idx==i) :  [ntokens, 64] boolean tensor ，
+            .max(dim=-1), max reduction along 64-dim : [ntokens, ][0] -> [ntokens]
+            token_sel[ntokens]
         """
         count = token_sel.sum().item()
         tokens = torch.sort(token_sel.to(torch.int), descending=True)[1]
         tokens[:count] = torch.sort(tokens[:count])[0]
+        """
+            * count: number of tokens with expert located in current rank(gpu)
+            * .sort() 返回 (sorted_vals, sorted_idx), sorted in 降序，先大后小
+                * 即将 token_sel 数组中 val=1 的值前置
+            * [1] 返回 sorted_idx 维度 存入 tokens 数组
+            * sort(tokens[:count])[0]， 对tokens中val=1 的 token_idx 做升序排列，且只返回 排序后的sorted_vals，即这里的 token_idx
+        * 效果: 注意仍在 rank loop 中，tokens 存的是将发送到当前rank 的 token_idx，且由小到大排列
+        """
         token_idx_in_rank[i][tokens[:count]] = torch.arange(count, dtype=torch.long, device='cuda')
-    """
-        num_tokens_per_rank[i] 类似 num_tokens_per_expert，这里只会拿到 local num_tokens_per_rank[i]
-
-    """
+        """
+            * token_idx_in_rank [num_ranks, num_tokens]
+            * tokens 数组 前 count 个元素，存的是将要发送给当前 gpu/rank_i 的 token_idx.  
+            * 对于 token_idx_in_rank[i] 中这些token_idx 位置赋上 0, 1, 2, .. 
+        * TODO: 
+        """
     for i in range(num_nodes):
         num_tokens_per_rdma_rank[i] = (rdma_rank_idx == i).sum()
+    """
+        rdma_rank_idx[ntokens, 8] 在 ntokens 维度上 sum后，即当前rdma_rank node上的 tokens 数量
+        * TODO: rdma_rank_idx vs rdma_idx ? 貌似应该是 rdma_idx ??
+    """
     token_idx_in_rank = token_idx_in_rank.T.contiguous().to(torch.int)
     is_token_in_rank = token_idx_in_rank >= 0
+    """
+        token_idx_in_rank.T ->   [num_ranks, num_tokens] ->  [num_tokens, num_ranks]，即从 gpu/rank视角 变成 以token 视角
+        token_idx_in_rank 做 element-wise >0 ，即 判断在 token为中心的视角，该token是否在某个rank  
+    """
     gbl_num_tokens_per_rank = num_tokens_per_rank.clone()
     dist.all_reduce(gbl_num_tokens_per_rank, group=group)
+    """
+        * num_tokens_per_rank[num_ranks, ]
+        same as num_tokens_per_expert，per rank 上只有 local num_tokens_per_rank[i], 需要 allreduce sync-up
+    """
 
     ref_num_tokens_per_rank, ref_num_tokens_per_rdma_rank, ref_num_tokens_per_expert, ref_is_token_in_rank, _ = \
         buffer.get_dispatch_layout(topk_idx, num_experts)
+    """
+        
+    """
     assert torch.allclose(ref_num_tokens_per_rank, num_tokens_per_rank)
     assert torch.allclose(ref_num_tokens_per_rdma_rank, num_tokens_per_rdma_rank)
     assert torch.allclose(ref_num_tokens_per_expert, num_tokens_per_expert)
