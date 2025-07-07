@@ -443,22 +443,39 @@ __forceinline__ __device__ void
 barrier_block(int** barrier_signal_ptrs, int rank) {
     auto thread_id = static_cast<int>(threadIdx.x);
 
+    /*
+        目标: inter-tblock 同步 跨多gpu/ranks 使用 pairwise 信号机制 ？？
+        * barrier_signal_ptrs[nvl_rank]
+        * kNumRanks 在 internode.cu 中为 NUM_MAX_NVL_PEERS(8)
+    */
+
     // For non-sync-only cases, the memory operations by other threads in the block must be visible to the `sys` scope
     if constexpr (not kSyncOnly) {
-        memory_fence();
-        __syncthreads();
+        memory_fence(); // 确保线程在__syncthraeds()之前，已经把需要写入global/lds 的内容，对其他线程可见
+        __syncthreads(); // 线程块级别同步
     }
 
     // Add self-ranks, sub other ranks
-    if (thread_id < kNumRanks) {
-        atomicAdd_system(barrier_signal_ptrs[rank] + thread_id, FINISHED_SUM_TAG);
-        atomicSub_system(barrier_signal_ptrs[thread_id] + rank, FINISHED_SUM_TAG);
+    if (thread_id < kNumRanks) { // 线程0~7 用于本机内 nvl_rank 同步
+        atomicAdd_system(barrier_signal_ptrs[rank] + thread_id, FINISHED_SUM_TAG); // signals completion to thread_id
+        /*
+            atomicAdd_system(ptr, val): 向 ptr 指向的内存地址增加 val，该操作是原子的，多个线程对这个地址并发写入不会冲突
+        */
+        atomicSub_system(barrier_signal_ptrs[thread_id] + rank, FINISHED_SUM_TAG); // acknowledge receipt from thread_id
+        /*
+            atomicSub_system(ptr, val)： 向ptr所指地址减去 val，也是线程安全的
+            这里的原子操作，都是ipc 操作
+        */        
     }
     EP_DEVICE_ASSERT(kNumRanks <= blockDim.x);
 
     // Check timeout
     auto start_time = clock64();
     while (true) {
+        /*  
+            wait untill all signals in current rank's array are <= 0 
+            __all_sync() for warp-level vote  
+        */
         auto value = thread_id < kNumRanks ? ld_volatile_global(barrier_signal_ptrs[rank] + thread_id) : 0;
         if (__all_sync(0xffffffff, value <= 0))
             break;
@@ -468,7 +485,7 @@ barrier_block(int** barrier_signal_ptrs, int rank) {
             trap();
         }
     }
-    __syncthreads();
+    __syncthreads(); // 同步 sm0 下所有的线程，256个线程都到达后，才继续执行后文
 }
 
 __forceinline__ __device__ int atomic_cas_cta_acquire(int* addr, int x, int y) {

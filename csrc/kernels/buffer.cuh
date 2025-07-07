@@ -99,6 +99,9 @@ public:
 
 template <typename dtype_t, bool kDecoupled = true>
 struct SymBuffer {
+/*
+
+*/
 private:
     // NOTES: for non-decoupled case, `recv_ptr` is not used
     uint8_t* send_ptr;
@@ -117,7 +120,7 @@ public:
         send_ptr = reinterpret_cast<uint8_t*>(gbl_ptr) + per_channel_bytes * sm_id;
         recv_ptr = reinterpret_cast<uint8_t*>(gbl_ptr) + per_channel_bytes * (sm_id + num_sms);
         gbl_ptr = reinterpret_cast<uint8_t*>(gbl_ptr) + total_bytes;
-    }
+    } // 创建用于nvshmem 通讯的 对等buffer，前提是 rdma enable on all nodes
 
     __device__ __forceinline__ dtype_t* send_buffer(int idx = 0) {
         EP_STATIC_ASSERT(kDecoupled, "`send_buffer` is only available for non-decoupled case");
@@ -128,11 +131,21 @@ public:
         EP_STATIC_ASSERT(kDecoupled, "`recv_buffer` is only available for non-decoupled case");
         return reinterpret_cast<dtype_t*>(recv_ptr + num_bytes * idx);
     }
+    /*
+        当 Decoupled=True，双向通讯中使用独立的 send/recv_buffer() 
+        * send_buffer(idx), 返回第 idx-th rdma_rank 的 send_ptr 指针，由  num_bytes * idx 偏移得到 
+        * recv_buffer(idx)，返回第 idx-th rdma_rank 的 recv_ptr 指针，由 num_bytes * idx 偏移得到
+        send_ptr 与 recv_ptr memory layout: [SM0_send, SM1_send, ...,  SM0_recv, SM1_recv ... ]
+        TODO: 对等buffer中，是谁发送/发往 idx-th ? 
+    */
 
     __device__ __forceinline__ dtype_t* buffer(int idx = 0) {
         EP_STATIC_ASSERT(not kDecoupled, "`buffer` is only available for decoupled case");
         return reinterpret_cast<dtype_t*>(send_ptr + num_bytes * idx);
     }
+    /*
+        当 Decoupled=False，双向通讯中使用统一的buffer() api, 即做send()，又做 recv() 
+    */
 };
 
 } // namespace deep_ep

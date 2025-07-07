@@ -93,40 +93,119 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
                 const nvshmem_team_t rdma_team) {
     auto sm_id = static_cast<int>(blockIdx.x);
     auto thread_id = static_cast<int>(threadIdx.x), warp_id = thread_id / 32, lane_id = get_lane_id();
-    auto num_threads = static_cast<int>(blockDim.x), num_warps = num_threads / 32;
+    auto num_threads = static_cast<int>(blockDim.x), num_warps = num_threads / 32; // 8
+
+    /*
+        * num_tokens_per_rank [64] # 在第一步构建数据时统计了要发到各rank的token数量
+        * moe_recv_counter_mapped [1] # 该节点最终会收到的token数，用于分配 recv_x 显存
+        * num_ranks(64)
+        * num_tokens_per_rdma_rank[num_rdma_rank(8)] # 发送到rdma节点的token数
+        * moe_recv_rdma_counter_mapped [1] # 从rdma收到的token数
+        * num_tokens_per_expert [256] # 发送到各expert的token数
+        * moe_recv_expert_counter_mapped # [1024] TODO: 只会用头部的4个，统计当前rank各expert收到的token数
+        * is_token_in_rank, #[4096, 64]
+        * num_channels, # 10
+        * expert_alignment, #1
+        * rdma_clean_offset,  # rdma_clean_meta.first, 83686400, 0.0836864e9 # TODO: 为什么 rdma_buffer 地址偏移从 这个数字开始 ?? 
+        * rdma_num_int_clean, # rdma_clean_meta.second, 6400  # TODO: what's for ?
+        * nvl_clean_offset,   # nvl_clean_meta.first, 85985280
+        * nvl_num_int_clean,  # nvl_clean_meta.second,2880 
+        * rdma_channel_prefix_matrix, #[num_rdma_ranks, num_channels], [8,10]
+        * recv_rdma_rank_prefix_sum, #[num_rdma_ranks], [8]
+        * gbl_channel_prefix_matrix, #[num_ranks, num_channels], [64, 10]
+        * recv_gbl_rank_prefix_sum, #[num_ranks], [64]
+        * rdma_buffer_ptr, #rdma cache, rdma_buffer_ptr, (byte)[1e9]
+        * barrier_signal_ptrs[NUM_MAX_NVL_PEERS][NUM_MAX_NVL_PEERS] 用于 tblock 内对等通知彼此，自己ready
+    */
 
     auto rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
     auto num_rdma_experts = num_experts / kNumRDMARanks, num_nvl_experts = num_rdma_experts / NUM_MAX_NVL_PEERS;
+    /*
+        * num_rdma_experts(256/8) ，per rdma_rank 上的 experts 数目
+        * num_nvl_experts(32/8), per nvlink 上的 experts 数目 
+    */
 
     if (sm_id == 0) {
+    /*
+        sm0 用于远端通讯
+    */
         // Communication with others
         // Global barrier: the first warp does intra-node sync, the second warp does internode sync
         EP_DEVICE_ASSERT(num_warps > 1);
         EP_DEVICE_ASSERT(kNumRDMARanks <= num_threads);
         if (thread_id == 32)
             nvshmem_sync_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
+        /*
+            thread_id==32, 即 warp1 的 1st thread，用来做 nvshmem 全局同步
+            1. 如果是 lowLatencyMode, 在 rdma_team 内的 gpu 之间同步
+            2. highThroughtMode, 在所有 rdma_teams(即集群层面)同步
+        */
         barrier_block<NUM_MAX_NVL_PEERS, true>(barrier_signal_ptrs, nvl_rank);
+        /*
+            * 用于 intra-node 内的GPU之间同步， barrier_signal_ptrs[8][8] 为`对等通信` a.k.a pair-wise communication，即 rank_i, rank_j 都告知对方 自己ready
+            * 注意这里是 节点内 ipc 通讯
+        */
 
         // Send numbers of tokens per rank/expert to RDMA ranks
+        // 1. 创建对等buffer，all rdma_ranks 可见 
         auto rdma_buffer_ptr_int = static_cast<int*>(rdma_buffer_ptr);
         auto rdma_recv_num_tokens_mixed = SymBuffer<int>(rdma_buffer_ptr, NUM_MAX_NVL_PEERS + num_rdma_experts + 1, kNumRDMARanks);
+        /*
+            * 构建用于rdma通讯的对等buffer
+            SymBuffer(void* &gbl_ptr, int num_elems, int num_ranks, int sm_id = 0, int num_sms = 1)
+            * num_elems=NUM_MAX_NVL_PEERS + num_rdma_experts + 1=8+32+1=41，即这个对等buffer里，存了41个整型指针，分别指向 每个 rdma_rank 上的 buffer 地址; 每个rdma_rank 上的 nexperts
+            * kNumRDMARanks=8
+            * 注意，这里使用 sm_id==0, num_sm==1 来创建 SymBuffer，对所有 rdma_rank 可见 
+        */
 
         // Clean up for later data dispatch
+        // 2. 初始化 rdma_buffer 
         EP_DEVICE_ASSERT(rdma_recv_num_tokens_mixed.total_bytes <= rdma_clean_offset * sizeof(int));
         #pragma unroll
         for (int i = thread_id; i < rdma_num_int_clean; i += num_threads)
             rdma_buffer_ptr_int[rdma_clean_offset + i] = 0;
+        /*
+            * rdma_clean_offset，rdma_buffer 起始地址
+            * rdma_num_int_clean(6400)，需要清零的buffer_size
+            * 注意这个操作是per thread 执行的，故 step=num_threads
+        */
 
         // Copy to send buffer
+        /* 
+            3. 填充 send_buffer，统计自己(rank)会往远端rdma_ranks 发送的tokens 统计信息，包括:
+                1. 发送给远端 rdma_rank 对应 8个nvl_peer 的tokens 数, e.g.  num_tokens_per_rank[i]
+                2. 发送给远端 rdma_rank 上32个experts 的tokens 数，e.g. num_tokens_per_expert[i]
+                3. 发送给远端 rdma_rank 上 总共的tokens 数，e.g. num_tokens_per_rdma_rank[thread_id];
+        */ 
         #pragma unroll
         for (int i = thread_id; i < num_ranks; i += num_threads)
             rdma_recv_num_tokens_mixed.send_buffer(i / NUM_MAX_NVL_PEERS)[i % NUM_MAX_NVL_PEERS] = num_tokens_per_rank[i];
+        /*
+            rdma_rank_idx = i / NUM_MAX_NVL_PEERS
+            local_rank_idx = i % NUM_MAX_NVL_PEERS，即当前rank/gpu，在节点内 local 索引
+            实际效果，当前 rdma_rank 向 symBuffer 实例 rdma_recv_num_tokens_mixed 的 rdma_rank_idx 子缓存区域的 local_rank_idx 位置，写入 num_tokens_per_rank[i]； 
+            写完成后，由于是 symBuffer实例，所有远端 rdma_rank 都能同步access该位置的vals
+        */
         #pragma unroll
         for (int i = thread_id; i < num_experts; i += num_threads)
             rdma_recv_num_tokens_mixed.send_buffer(i / num_rdma_experts)[NUM_MAX_NVL_PEERS + i % num_rdma_experts] = num_tokens_per_expert[i];
+        /*
+            * rdma_rank_idx =  i / num_rdma_experts，即当前 i-th expert 落在哪个 rdma_rank 上
+            * local_expert_idx = i % num_rdma_experts，即当前 i-th expert 在当前 rdma_rank 上的局部索引
+            实际效果：当前 rdma_rank 向 symBuffer 实例 rdma_recv_num_tokens_mixed 的 rdma_rank_idx 子缓冲区域中的 local_expert_idx 位置，写入 num_tokens_per_expert[i]；
+            写完后，所有远端 rdma_rank 都能同步access 该位置的vales
+        */
         if (thread_id < kNumRDMARanks)
             rdma_recv_num_tokens_mixed.send_buffer(thread_id)[NUM_MAX_NVL_PEERS + num_rdma_experts] = num_tokens_per_rdma_rank[thread_id];
         __syncthreads();
+        /*
+            实际效果：当前 rdma_rank 向 symBuffer 实例 rdma_recv_num_tokens_mixed[thread_idx] 子缓冲区域中的第 40(NUM_MAX_NVL_PEERS + num_rdma_experts)个位置，
+            写入  num_tokens_per_rdma_rank[thread_id]; 
+        */
+
+        /*
+            TODO: 不是 symBuffer 就是所有 rdma_rank 可见的嘛？为什么还需要再 send_buffer(i) 写 recv_buffer(rdma_rank) ??
+        */
 
         // Issue send
         // TODO: more light fence or barrier or signaling
@@ -146,16 +225,17 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
         }
         __syncthreads();
 
-        // Wait previous operations to be finished
+        // Wait previous operations to be finished。 有 i!=rdma_rank 对应，等待跨节点 同步完成
         if (thread_id < kNumRDMARanks and thread_id != rdma_rank)
             nvshmemi_ibgda_quiet(translate_dst_rdma_rank<kLowLatencyMode>(thread_id, nvl_rank), 0);
         __syncthreads();
 
-        // Barrier
+        // Barrier， 与 i==rdma_rank 对应，等待同一个rdma_team内同步完成
         if (thread_id == 0)
             nvshmem_sync_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
         /*
-            sync before/after sending token counts，ensure consistent view of metadata across nodes
+            在rdma_team 中，每个rank只收到了同rdma_team的8个节点信息，其他56个rank的信息，则是通过ipc 从 同rdma_rank 上的 rank 上获取。
+            这里所有通讯都是双向的，从而每个节点都可以获取全局发送给到自己的tokens相关信息
         */
         __syncthreads();
 
@@ -167,6 +247,9 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
         auto nvl_send_num_tokens_per_expert = AsymBuffer<int>(nvl_send_buffer, num_nvl_experts, NUM_MAX_NVL_PEERS);
         auto nvl_recv_num_tokens_per_rank = AsymBuffer<int>(nvl_recv_buffer, kNumRDMARanks, NUM_MAX_NVL_PEERS);
         auto nvl_recv_num_tokens_per_expert = AsymBuffer<int>(nvl_recv_buffer, num_nvl_experts, NUM_MAX_NVL_PEERS);
+        /*
+            TODO
+        */
 
         // Clean up for later data dispatch
         auto nvl_buffer_ptr_int = static_cast<int*>(buffer_ptrs[nvl_rank]);
@@ -212,7 +295,7 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
         }
         barrier_block<NUM_MAX_NVL_PEERS>(barrier_signal_ptrs, nvl_rank);
         /*
-            * 用于 intra-node 内的GPU之间同步， uses shared mem signaling for low-overhead sync 
+            用于 intra-node 内的GPU之间同步， barrier_signal_ptrs[8][8] 为`对等通信`，即 rank_i, rank_j 都告知对方 自己ready 
         */
 
         // Reduce the number of tokens per rank/expert
