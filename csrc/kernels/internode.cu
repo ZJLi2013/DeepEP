@@ -397,6 +397,7 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
             int token_start_idx, token_end_idx;
             get_channel_task_range(num_tokens, num_channels, channel_id, token_start_idx, token_end_idx); // 获取到当前warp需要处理token的[起始地址, 结束地址)
             /*
+                * ntokens 维度上拆分成 10x channels，每个 channel 对应由一个 warp 负责发送/接收
                 per warp 对应 per channel 上 tokens 处理。per warp 需要处理 1个或多个 channel
                 per lane 对应 per token 处理
             */
@@ -542,7 +543,39 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
          void** buffer_ptrs, int num_max_nvl_chunked_send_tokens, int num_max_nvl_chunked_recv_tokens,
          int rank, int num_ranks) {
     /*
-            
+        * recv_x,  // [m, 7168]，用于接受发送到本节点的token, 给后续的expert层计算, m来自由 notify_dispatch moe_recv_counter
+        * recv_x_scales,  // [m,56]
+        * recv_topk_idx, // [m,8]
+        * recv_src_meta, //[m, 8] （8byte, 2int, src_rdma_rank, is_token_in_nvl_rank_bits）
+        * x, // [4096, 7168], 用于本节点发送出去的token
+        * x_scales, //[4096,56]
+        * topk_idx, //[4096, 8]
+        * send_rdma_head, //[m, 8] // TODO ?
+        * send_nvl_head,  //[m, 8] // TODO ? 
+        * recv_rdma_channel_prefix_matrix, //[8, 10] 远端rdma_rank发送给自己的信息
+            * 理解：分别从所有 8个 rdma_rank 接收的tokens 数分成 10x channels 从远端发送而来
+        * recv_gbl_channel_prefix_matrix, //[64, 10], 远端rank各通道发送给自己的信息
+            * 理解：分别从所有 64个 gpu_rank 接受的tokens 数分成 10x channels 发送而来
+        * rdma_channel_prefix_matrix, //[8, 10] 通道发送给rdma的累加信息
+            * TODO，跟 recv_rdma_channel_prefix_matrix 什么区别??
+        * recv_rdma_rank_prefix_sum, //[8] 远端 rdma发送给自己的累加信息
+            * 远端8个 rdma_rank，分别发送到当前 rdma_rank 上的tokens 总数
+
+        * gbl_channel_prefix_matrix,  //[64, 10] 通道发送给rank的累加信息
+        * recv_gbl_rank_prefix_sum, //[64], 远端rank发送给自己的累加信息
+        * num_tokens, // 4096
+        * hidden_int4, // 448
+        * num_scales, // 56
+        * num_topk, // 8
+        * num_experts, // 256
+        * is_token_in_rank, //[4096, 64]
+        * rdma_buffer_ptr, //用于rdma通信的缓存 1e9 byte
+        * num_max_rdma_chunked_send_tokens, //28
+        * num_max_rdma_chunked_recv_tokens, //140
+        * buffer_ptrs, // 用于ipc通信的缓存 1e9 byte
+        * num_max_nvl_chunked_send_tokens, //20
+        * num_max_nvl_chunked_recv_tokens, //288
+        * num_ranks //64
     */
     enum class WarpRole {
         kRDMASender,
@@ -551,6 +584,30 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         kForwarderCoordinator,
         kNVLReceivers
     };
+    /*  Warp Role 解释: 
+            * kRDMASender，处理跨节点的rdma 数据发送
+                * 管理 rdma buffer 元数据 (NUM_MAX_NVL_PEERS*2+2个int)
+                * 将 token 分发信息写入 symBuffer 
+                * 执行 rdma put 操作(nvshmem_ibgda_put_nbi_warp)
+                * 处理 rdma channel 的 head/tail 指针同步 ??
+            * kRDMASenderCoordinator, 协调多个 rdmaSender
+                * 维护共享内存中的锁和窗口状态(rdma_send_channel_lock/tail/window)
+                * 批处理rdma事务(每个事务最多32x tokens)
+                * 处理跨channel的令牌发送协调
+                * 执行最终的nvshmem同步
+            * kRDMAAndNVLForwarder (rdma/nvl 转发器)，桥接 rdma 和 nvlink 通信
+                * 从 rdma buffer 读取数据(nvl_channel_x/ nvl_channel_src_meta等)
+                * 将 rdma 数据转化为 nvl 格式 ？？
+            * kForwarderCoordinator 转发协调器
+                * 维护 forward_channel_head 矩阵(num_max_nvl_peers * kNumRDMARanks)
+                * 执行跨nvl_rank 的head 指针同步
+                * 处理超时等
+            * kNVLReceivers，处理nvlink 接收逻辑
+                * 从 nvlink buffer 读取数据 (nvl_channel_x)
+                * 执行数据聚合 combine_token()
+                * 管理 combined_x, combined_topk_weights 输出buffer
+        TODO 
+    */
 
     const auto num_sms = static_cast<int>(gridDim.x);
     const auto sm_id = static_cast<int>(blockIdx.x);
@@ -559,6 +616,12 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
     const auto num_channels = num_sms / 2, channel_id = sm_id / 2;
     const bool is_forwarder = sm_id % 2 == 0;
     const auto rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
+    /*
+        num_sms 20 
+        num_threads 512
+        num_warps 16 
+        num_channels 10 
+    */
 
     EP_DEVICE_ASSERT(ibgda_get_state()->num_rc_per_pe == num_channels or ibgda_get_state()->num_rc_per_pe >= num_sms);
 
@@ -577,6 +640,9 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             return {WarpRole::kNVLReceivers, (warp_id + channel_id - kNumDispatchRDMASenderWarps) % NUM_MAX_NVL_PEERS};
         }
     }();
+    /*
+        
+    */
     auto warp_role = role_meta.first;
     auto target_rank = role_meta.second; // Not applicable for RDMA senders
     EP_DEVICE_ASSERT(num_warps == kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS);
