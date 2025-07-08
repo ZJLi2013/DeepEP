@@ -67,6 +67,9 @@ public:
             gbl_ptrs[i] = reinterpret_cast<uint8_t*>(gbl_ptrs[i]) + total_bytes;
         }
     }
+    /*
+        对于 multi rdma_ranks，理解是 per rdma_rank 有一个独立的 gbl_ptr
+    */
 
     __device__ __forceinline__ void advance(int shift) {
         #pragma unroll

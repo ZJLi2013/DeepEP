@@ -908,10 +908,10 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
         gbl_channel_prefix_matrix = torch::empty({num_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
         recv_gbl_rank_prefix_sum = torch::empty({num_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
         /*
-            * rdma_channel_prefix_matrix，per rdma_rank 到per channel的prefix-sum，用于标记每个rdma_rank 上每个channel 的起始位置
-            * recv_rdma_rank_prefix_sum，rdma rank 接收到的 token 数目的prefix-sum，前后差值可以标记每个 rdma_rank 上接收的tokens 数
-            * gbl_channel_prefix_matrix per rank 到 per channel 映射的prefix-sum,用于标记每个 rank 上 channel 的起始位置
-            * recv_gbl_rank_prefix_sum, global_ranks 接收到 tokens 数目的 prefix_sum，用于标记per gbl_rank 上接收的 tokens 数
+            * rdma_channel_prefix_matrix ，per rdma_rank 到per channel的prefix-sum，用于标记每个rdma_rank 上每个channel 的起始位置
+            * recv_rdma_rank_prefix_sum ，rdma rank 接收到的 token 数目的prefix-sum，前后差值可以标记每个 rdma_rank 上接收的tokens 数
+            * gbl_channel_prefix_matrix ， per rank 到 per channel 映射的prefix-sum,用于标记每个 rank 上 channel 的起始位置
+            * recv_gbl_rank_prefix_sum , global_ranks 接收到 tokens 数目的 prefix_sum，用于标记per gbl_rank 上接收的 tokens 数
         */
 
         // Send sizes
