@@ -526,6 +526,7 @@ template <bool kLowLatencyMode, int kNumRDMARanks, bool kCachedMode,
           int kNumDispatchRDMASenderWarps, int kNumTopkRDMARanks = get_num_topk_rdma_ranks(kNumRDMARanks)>
 __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * 32), 1)  
 /*
+    * kNumDispatchRDMASenderWarps=7
     * kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS = 16 ，即 dispatch() kernel 使用 16x warps launch
     * nblocks=1 ，即在一个物理sm留存一个软件block。 
     * 再加上 <<<20， >>>，即使用 20个block, 分配20个物理sm用于通信的目的。
@@ -614,17 +615,18 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
     const auto num_threads = static_cast<int>(blockDim.x), num_warps = num_threads / 32;
     const auto thread_id = static_cast<int>(threadIdx.x), warp_id = thread_id / 32, lane_id = get_lane_id();
     const auto num_channels = num_sms / 2, channel_id = sm_id / 2;
-    const bool is_forwarder = sm_id % 2 == 0;
+    const bool is_forwarder = sm_id % 2 == 0;  // sm 分成 奇、偶 两组
     const auto rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
     /*
         num_sms 20 
         num_threads 512
-        num_warps 16 
+        num_warps 16 // 注意，这里是 per sm 含 16 warps。
         num_channels 10 
     */
 
     EP_DEVICE_ASSERT(ibgda_get_state()->num_rc_per_pe == num_channels or ibgda_get_state()->num_rc_per_pe >= num_sms);
 
+    // role_meta 是节点内的role meta
     const auto role_meta = [=]() -> std::pair<WarpRole, int> {
         if (is_forwarder) {
             if (warp_id < NUM_MAX_NVL_PEERS) {
@@ -632,7 +634,19 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             } else {
                 return {WarpRole::kForwarderCoordinator, warp_id - NUM_MAX_NVL_PEERS};
             }
-        } else if (warp_id < kNumDispatchRDMASenderWarps) {
+        /*
+            * is_forwarder 即 偶数编号的 sms 上，其中 
+                * warp0~7 为 kRDMAAndNVLForwarder，即负责节点内 rdma_rank 标记的 gpu 与其他gpu 之间的 nvl 转发，亦即 从rdma_recv_buffer 转写节点内 nvl_buffer 
+                * warp8~15 为 kForwarderCoordinator, 向远端rdma_rank 确认接收
+        */
+        } 
+        /*
+            奇数编号的sms 上 :
+                1. warp0~6 为 kRDMASender，从 x 写入 rdma_send_buffer 
+                2. warp7 为 kRDMASenderCoordinator，将 rdma_send_buffer 写入 远端  rdma_rank 的 recv_buffer 中
+                3. warp8~15 为 kNVLReceivers，从 nvl_buffer 写入 recv_x 
+        */
+        else if (warp_id < kNumDispatchRDMASenderWarps) {
             return {WarpRole::kRDMASender, -1};
         } else if (warp_id == kNumDispatchRDMASenderWarps) {
             return {WarpRole::kRDMASenderCoordinator, -1};
@@ -641,7 +655,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         }
     }();
     /*
-        
+        * role_meta 返回 <warpRole，target_rank> 序列
+        * TODO: 每个 warpRole 对应的 target_ranks 
     */
     auto warp_role = role_meta.first;
     auto target_rank = role_meta.second; // Not applicable for RDMA senders
@@ -658,15 +673,58 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
     auto rdma_channel_meta = SymBuffer<int>(rdma_buffer_ptr, NUM_MAX_NVL_PEERS * 2 + 2, kNumRDMARanks, channel_id, num_channels);
     auto rdma_channel_head = SymBuffer<uint64_t, false>(rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
     auto rdma_channel_tail = SymBuffer<uint64_t, false>(rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
+    /*
+        * num_bytes_per_rdma_token
+            * token hidden_bytes 7168
+            * scale 7168/128 * 4 =224
+            * topk_idx: 8 * 4 = 32
+            * topk_weight: 8 * 4 = 32
+            * sourceMeta 8
+            * 16byte对齐后为 7472 bytes
+        
+        * num_max_rdma_chunked_recv_tokens, //140
+        * SymBuffer(gbl_ptr, num_elems, num_ranks, sm_id=0, nums_sm=1)
+        * rdma_channel_data[channel_i].send_ptr 首地址:  gbl_ptr + num_max_rdma_chunked_recv_tokens * num_bytes_per_rdma_token * kNumRDMARanks * channel_i 
+        * rdma_channel_data[channel_i].recv_ptr 首地址:  gbl_ptr + num_max_rdma_chunked_recv_tokens * num_bytes_per_rdma_token * kNumRDMARanks * ( channel_i + num_channels)
+        * rdma_channel_meta[channel_i].send_ptr 首地址: gbl_ptr + (NUM_MAX_NVL_PEERS * 2 + 2) * kNumRDMARanks * channel_id 
+        * rdma_channel_meta[channel_i].recv_ptr 首地址: gbl_ptr + (NUM_MAX_NVL_PEERS * 2 + 2) * kNumRDMARanks * ( channel_id + num_channels)
+        * rdma_channel_head[channel_i].send_ptr 首地址： gbl_ptr + 1*kNumRDMARanks*channel_id 
+        * rdma_channel_head[channel_i].recv_ptr 首地址： gbl_ptr + 1*kNumRDMARanks* ( channel_id + num_channels)
+        * rdma_channel_tail[channel_i].send_ptr 首地址： gbl_ptr + 1*kNumRDMARanks*channel_id 
+        * rdma_channel_tail[channel_i].recv_ptr 首地址： gbl_ptr + 1*kNumRDMARanks* ( channel_id + num_channels)        
+
+        TODO: head/tail 指针怎么用的？？ 
+    */
 
     // NVL buffer layouts
     // NOTES: `rs_wr_buffer_ptr` means "Read for Senders, Write for Receivers", `ws_rr_buffer_ptr` means "Write for Senders, Read for Receivers"
     void *rs_wr_buffer_ptr = nullptr, *ws_rr_buffer_ptr = nullptr;
+    /*
+        * 同一个指针，可能对 Forwarder 是“读”，但对 Receiver 是“写”。
+        * buffer_ptrs, 是节点内8个gpu的共享内存地址，由 ipc handle 映射的一块buffer: 1e9 byte，节点内8个gpu 均可见。
+    */
     int rs_wr_rank = 0, ws_rr_rank = 0;
     if (warp_role == WarpRole::kRDMAAndNVLForwarder)
         rs_wr_buffer_ptr = buffer_ptrs[nvl_rank], ws_rr_buffer_ptr = buffer_ptrs[target_rank], rs_wr_rank = nvl_rank, ws_rr_rank = target_rank;
+    /*
+        * 对于 kRDMAAndNVLForwarder 角色的 warps(warp0~7 on each even sm)， 其负责节点内从 local rdma buffer 读取信息填入到 remote nvl_buffer
+        * 当前 nvl_rank 从 buffer_pts[nvl_rank] 读取，通过nvl 通信，写入peers remote GPU 的 nvl_buffer，即 buffer_ptrs[target_rank]
+        * rs_wr_buffer_ptr 是共享buffer 上nvl_rank 读取地址 , [source] local rdma send_buffer
+        * ws_rr_buffer_ptr 是共享buffer上 target_rank 写出地址，[destination] remote nvl buffer 
+    */
     if (warp_role == WarpRole::kNVLReceivers)
         rs_wr_buffer_ptr = buffer_ptrs[target_rank], ws_rr_buffer_ptr = buffer_ptrs[nvl_rank], rs_wr_rank = target_rank, ws_rr_rank = nvl_rank;
+    /*
+        * 对于 kNVLReceivers 角色的warps(warp8~15 on each odd sm)，其负责从 nvl_buffer 读取信息填入 自己(nvl_rank) 的 recv_x 
+        * rs_wr_buffer_ptr 是共享buffer 上 target_rank 读取地址，(其上数据即forwarder 阶段 target_rank 写出的数据)， [source] remote nvl_buffer
+        * ws_rr_buffer_ptr 是共享buffer 上 写入 nvl_rank(当前rank)的 recv_buffer 地址，[destination] local rdma recv_buffer 
+    */
+
+    /*
+        总结目前理解，
+            1) 当warpRole 是 rdma&nvlForwarder，则从当前 nvl_rank 对应的 rdma_buffer.send_buffer 中取值，填入 remote target_ranks(即其余peer gpu)的 nvl_buffer
+            2）当warpRole 是 nvlReceivers，则从remote target_ranks 的nvl_buffer 中取值， 写入当前 nvl_rank 对应的 rdma_buffer.recv_buffer中 
+    */
 
     // Allocate buffers
     auto nvl_channel_x = AsymBuffer<int4>(ws_rr_buffer_ptr, num_max_nvl_chunked_recv_tokens * hidden_int4, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank).advance_also(rs_wr_buffer_ptr);
@@ -678,6 +736,20 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
     auto nvl_channel_prefix_end = AsymBuffer<int>(ws_rr_buffer_ptr, kNumRDMARanks, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank).advance_also(rs_wr_buffer_ptr);
     auto nvl_channel_head = AsymBuffer<int>(rs_wr_buffer_ptr, 1, NUM_MAX_NVL_PEERS, channel_id, num_channels, ws_rr_rank).advance_also(ws_rr_buffer_ptr);
     auto nvl_channel_tail = AsymBuffer<int>(ws_rr_buffer_ptr, 1, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank).advance_also(rs_wr_buffer_ptr);
+    /*
+        * ws_rr_buffer_ptr 指向 target_rank ipc， 即 ipc ranks  
+        * rs_wr_buffer_ptr 指向 src_rank buffer ，即 current nvl_rank 读取(read)自己的 send_buffer 以发送(send)到远端 target_ranks 的 recv_buffer 
+
+        * AsymBuffer(gbl_ptr, num_elems, num_ranks, sm_id = 0, num_sms = 1, offset = 0)
+
+        * nvl_channel_x[channel_id][rs_wr_rank].ptrs[0] 首地址， ws_rr_buffer_ptr[0] + num_bytes * NUM_MAX_NVL_PEERS * channel_id + num_bytes * rs_wr_rank 
+        * nvl_channel_x[channel_id][rs_wr_rank].ptrs[1] 首地址， ws_rr_buffer_ptr[1] + num_bytes * NUM_MAX_NVL_PEERS * channel_id + num_bytes * rs_wr_rank 
+        * ..
+        * nvl_channel_x[channel_id][rs_wr_rank].ptrs[7] 首地址， ws_rr_buffer_ptr[7] + num_bytes * NUM_MAX_NVL_PEERS * channel_id + num_bytes * rs_wr_rank 
+        * 同理 for  nvl_channel_src_meta, x_scales, topk_idx, topk_weights
+        
+        * TODO: prefix_start, prefix_end, head, tail 怎么用??
+    */
 
     // RDMA sender warp synchronization
     // NOTES: `rdma_send_channel_tail` means the latest released tail
@@ -691,13 +763,37 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
     __shared__ volatile int forward_channel_head[NUM_MAX_NVL_PEERS][kNumRDMARanks];
     __shared__ volatile bool forward_channel_retired[NUM_MAX_NVL_PEERS];
     auto sync_forwarder_smem = []() { asm volatile("bar.sync 1, %0;" :: "r"((NUM_MAX_NVL_PEERS + 1) * 32)); };
+    /*
+        TODO: 
+    */
 
     if (warp_role == WarpRole::kRDMASender) {
         // Get tasks
         int token_start_idx, token_end_idx;
         get_channel_task_range(num_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
+        /*
+            * ntokens 维度上拆分成 10x channels，每个 channel 对应由一个 warp 负责发送/接收
+            per warp 对应 per channel 上 tokens 处理。per warp 需要处理 1个或多个 channel
+            per lane 对应 per token 处理
+        */
 
         // Send number of tokens in this channel by `-value - 1`
+        /*
+            * 由8个warp，每个warp处理一个远端 rdma_rank。
+
+            1.  rdma_channel_meta 的 buffer 选择
+                * 当目标rank 就是本rank，则使用 recv_buffer(避免自发送)
+                * 当目标rank 是其他Rank，则使用 send_buffer 
+
+            * gbl_channel_prefix_matrix[64, 10] # nranks * nchannels 
+            * rdma_channel_prefix_matrix[8, 10] # nrdma_ranks * nchannels 
+
+            2. 每个warp 处理一个 rdma_rank，并按 lane_id 划分工作
+                * lane0~7，编码nvl peers 的前缀和, gbl_channel_prefix_matrix。本channel 在远端8个 rdma_rank  上的起始 index 取负数
+                * lane8~15，编码当前channel 的 nvl peers 结束位置。本channel 在远端8个 rdma_rank 上的结束 index 取负数
+                * lane16，编码rdma 通道的起始位置，rdma_channel_prefix_matrix。本channel 在远端 rdma_rank 上起始index 取负 
+                * lane17，编码rdma 通道的结束位置
+        */
         EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * 2 + 2 <= 32, "Invalid number of NVL peers");
         for (int dst_rdma_rank = warp_id; dst_rdma_rank < kNumRDMARanks; dst_rdma_rank += kNumDispatchRDMASenderWarps) {
             auto dst_ptr = dst_rdma_rank == rdma_rank ? rdma_channel_meta.recv_buffer(dst_rdma_rank) : rdma_channel_meta.send_buffer(dst_rdma_rank);
@@ -712,7 +808,10 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             }
             __syncwarp();
 
-            // Issue RDMA for non-local ranks
+            // Issue RDMA for non-local ranks, 通过 nvshmem 发送 send_buffer 到远端 rdma_rank 节点
+            /*
+                nvshmemx_int_put_nbi_warp是一个warp级别函数，需要当前warp全部线程参与
+            */
             if (dst_rdma_rank != rdma_rank) {
                 nvshmemi_ibgda_put_nbi_warp<true>(reinterpret_cast<uint64_t>(rdma_channel_meta.recv_buffer(rdma_rank)),
                                                   reinterpret_cast<uint64_t>(rdma_channel_meta.send_buffer(dst_rdma_rank)),
@@ -721,12 +820,17 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                                                   channel_id, lane_id, 0);
             }
         }
-        sync_rdma_sender_smem();
+        sync_rdma_sender_smem(); // 同步 kRDMASender 和 kRDMASenderCoordinator ，所有8个warp 完成后，再进入下一步
 
         // Iterate over tokens and copy into buffer
         int64_t token_idx;
         int cached_rdma_channel_head = 0, global_rdma_tail_idx = 0;
         auto send_buffer = lane_id == rdma_rank ? rdma_channel_data.recv_buffer(lane_id) : rdma_channel_data.send_buffer(lane_id);
+        /*
+            * 填充 send_buffer：
+                1. 如果是 rdma_rank 本身，直接将 rdma_channel_data.recv_buffer() 设置为 send_buffer
+                2. 否则，就是当前channel 的 send_buffer + lane_id 偏移
+        */
         for (token_idx = token_start_idx; token_idx < token_end_idx; ++ token_idx) {
             // Read RDMA rank existence
             uint64_t is_token_in_rank_uint64 = 0;
@@ -734,13 +838,28 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 is_token_in_rank_uint64 = __ldg(reinterpret_cast<const uint64_t*>(is_token_in_rank + token_idx * num_ranks + lane_id * NUM_MAX_NVL_PEERS));
                 global_rdma_tail_idx += (is_token_in_rank_uint64 != 0);
             }
-            __syncwarp();
+            __syncwarp(); // 确保8条lane 都完成读取，在后续指向
+            /*
+                * 读取跨节点分发信息，关键优化：
+                    1. 使用 __ldg() 指令 进行常量缓存读取，减少dram访问延迟
+                    2. 将 8x bool package 成 uint64 读取。 per bool 偏移计算: token_idx * num_ranks + lane_id * NUM_MAX_NVL_PEERS
+                * uint64 表示当前token 在 target rdma_rank 上8个gpu 上的分布情况 
+                * global_rdma_tail_idx 统计该token需要发送给的RDMA_ranks 的数量
+                * 这里 per lane 处理 (per token 是否要发送到) 某个 rdma_rank
+            */
 
             // Skip the token which does not belong to this warp
             if ((token_idx - token_start_idx) % kNumDispatchRDMASenderWarps != warp_id)
                 continue;
+            /*
+                每个 warp 处理 的token list:   warp_id, warp_id+7, warp_id+14, ...
+                这里 bypass 不属于当前warp 要处理的 tokens
+            */
             auto rdma_tail_idx = is_token_in_rank_uint64 == 0 ? -1 : global_rdma_tail_idx - 1;
-
+            /*
+                 * 若当前token 不需要发送给 当前 rdma_rank， 则 tail_idx = -1 (无效索引)
+                 * 若当前 token 需要发送给 当前 rdma_rank，则 tail_idx 为实际尾指针(glb_rdma_tail_idx-1)
+            */
             // Wait the remote buffer to be released
             auto start_time = clock64();
             while (is_token_in_rank_uint64 != 0 and rdma_tail_idx - cached_rdma_channel_head >= num_max_rdma_chunked_recv_tokens) {
@@ -753,11 +872,22 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                     trap();
                 }
             }
+            /*
+                1. 通过使用 RingBuffer，发送端只维护 tail_ptr, 而接收端只维护 head_ptr，即可实现无锁设计
+                2. 通过在发送端维护 head_ptr 的副本 cached_rdma_channel_head，减少频繁 head_ptr 读取。
+                只有当`tail_ptr - cached_head_ptr >= 缓冲区大小`时，才更新该 cached_rdma_channel_head
+            */
             __syncwarp();
 
             // Store RDMA head for combine
             if (lane_id < kNumRDMARanks and not kCachedMode)
                 send_rdma_head[token_idx * kNumRDMARanks + lane_id] = rdma_tail_idx;
+            /*
+                * rdma_tail_idx，当前token 在 target rdma_rank rdma_buffer 中的写入位置
+                * send_rdma_head [ntokens, num_rdma_ranks] # 这里 lane_id 与 n_rdma_rank_idx 等价
+                所以，这里实际上是 token_idx 在 lane_id 个 rdma_rank 上的 rdma_head 指针更新?
+
+            */
 
             // Broadcast tails
             SourceMeta src_meta;
@@ -774,6 +904,9 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 dst_send_buffers[num_topk_ranks ++] = reinterpret_cast<uint8_t*>(broadcast(send_buffer, i)) + slot_idx * num_bytes_per_rdma_token;
             }
             EP_DEVICE_ASSERT(num_topk_ranks <= kNumTopkRDMARanks);
+            /*
+                
+            */
 
             // Copy `x` into symmetric send buffer
             auto st_broadcast = [=](const int key, const int4& value) {
