@@ -748,7 +748,11 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         * nvl_channel_x[channel_id][rs_wr_rank].ptrs[7] 首地址， ws_rr_buffer_ptr[7] + num_bytes * NUM_MAX_NVL_PEERS * channel_id + num_bytes * rs_wr_rank 
         * 同理 for  nvl_channel_src_meta, x_scales, topk_idx, topk_weights
         
-        
+        #######################
+        * nvl_channel_prefix_start/end  用来 coordinate token transfers 在gpu peers 之间
+         
+        TODO 
+
         ######################## 
         * nvl_channel_head 用来记录 read(head)消费者从 nvl_buffer 中读取的位置
 
@@ -1485,16 +1489,25 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         EP_STATIC_ASSERT(kNumRDMARanks <= 32, "Invalid number of RDMA peers");
         if (lane_id < kNumRDMARanks and lane_id * NUM_MAX_NVL_PEERS + src_nvl_rank > 0)
             total_offset = recv_gbl_rank_prefix_sum[lane_id * NUM_MAX_NVL_PEERS + src_nvl_rank - 1];
+        /*
+            * src_nvl_rank：接收nvl_buffer的主体
+            * total_offset, src_nvl_rank 从 lane_id（当前rdma_rank) 接收的tokens 起始gbl_offset
+        */
 
         // Receive channel offsets
         int start_offset = 0, end_offset = 0, num_tokens_to_recv;
         auto start_time = clock64();
-        while (lane_id < kNumRDMARanks) {
-            start_offset = ld_volatile_global(nvl_channel_prefix_start.buffer() + lane_id);
-            end_offset = ld_volatile_global(nvl_channel_prefix_end.buffer() + lane_id);
-            if (start_offset < 0 and end_offset < 0) {
+        while (lane_id < kNumRDMARanks) { // poll(轮询) nvlink channel metadata 
+            start_offset = ld_volatile_global(nvl_channel_prefix_start.buffer() + lane_id); 
+            end_offset = ld_volatile_global(nvl_channel_prefix_end.buffer() + lane_id); 
+            /*
+                * start_offset: 来自 lane_id(当前rdma_rank) 的tokens start id
+                * end_offset: 来自lane_id(当前rdma_rand) 的tokens end id
+                * nvl_channel_prefix_start/end.buffer() 在 RDMAAndNVLForwarder 中填充负值
+            */
+            if (start_offset < 0 and end_offset < 0) { // * 负值，说明 metadata is ready ?
                 start_offset = -start_offset - 1, end_offset = -end_offset - 1;
-                total_offset += start_offset;
+                total_offset += start_offset; // 将 channel start offset 添加到 glb_offset
                 break;
             }
 
@@ -1505,12 +1518,15 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 trap();
             }
         }
-        num_tokens_to_recv = warp_reduce_sum(end_offset - start_offset);
+        num_tokens_to_recv = warp_reduce_sum(end_offset - start_offset); // warp-level 一共接收的tokens数，即从所有 rdma_rank 上接收的tokens 总数
 
         // Save for combine usage
         if (lane_id < kNumRDMARanks and not kCachedMode)
             recv_gbl_channel_prefix_matrix[(lane_id * NUM_MAX_NVL_PEERS + src_nvl_rank) * num_channels + channel_id] = total_offset;
         __syncwarp();
+        /*
+            TODO 理解下， recv_gbl_channel_prefix_matrix 在后续 combine 阶段怎么用的
+        */
 
         int cached_channel_head_idx = 0, cached_channel_tail_idx = 0;
         while (num_tokens_to_recv > 0) {
@@ -1521,7 +1537,9 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 if (cached_channel_head_idx != cached_channel_tail_idx)
                     break;
                 cached_channel_tail_idx = ld_acquire_sys_global(nvl_channel_tail.buffer());
-
+                /*
+                    类似，使用 lane0 做 buffer ready 检查。如果 head == tail 即没有 可用 slot，则跟新 本地 cached_tail
+                */
                 // Timeout check
                 if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
                     printf("DeepEP dispatch NVL receiver timeout, channel: %d, RDMA: %d, nvl: %d, src NVL: %d, head: %d, tail: %d\n",
@@ -1532,14 +1550,20 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
 
             // Sync queue tail
             cached_channel_tail_idx = __shfl_sync(0xffffffff, cached_channel_tail_idx, 0);
+            // 将lane0 上 cached_tail 广播给所有lanes（only first 8)
 
             // Copy data
             int num_recv_tokens = cached_channel_tail_idx - cached_channel_head_idx;
             for (int chunk_idx = 0; chunk_idx < num_recv_tokens; ++ chunk_idx, -- num_tokens_to_recv) {
                 int token_idx_in_buffer = (cached_channel_head_idx ++) % num_max_nvl_chunked_recv_tokens;
                 auto meta = ld_nc_global(nvl_channel_src_meta.buffer() + token_idx_in_buffer);
-                int64_t recv_token_idx = __shfl_sync(0xffffffff, total_offset, meta.src_rdma_rank);
+                int64_t recv_token_idx = __shfl_sync(0xffffffff, total_offset, meta.src_rdma_rank); 
                 (lane_id == meta.src_rdma_rank) ? (total_offset += 1) : 0;
+                /*
+                    src_rdma_rank 上的 total_offset 广播给所有lanes，
+                    如果是当前处理 src_rdma_rank 对应的 lane, 则当前iter 处理一个token， total_offset++
+                    后续，开始将 nvl_channel_x 中data copy 到 recv_x 中
+                */
 
                 // Copy data
                 UNROLLED_WARP_COPY(5, lane_id, hidden_int4,
