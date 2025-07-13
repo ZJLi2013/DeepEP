@@ -151,10 +151,11 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
         auto rdma_buffer_ptr_int = static_cast<int*>(rdma_buffer_ptr);
         auto rdma_recv_num_tokens_mixed = SymBuffer<int>(rdma_buffer_ptr, NUM_MAX_NVL_PEERS + num_rdma_experts + 1, kNumRDMARanks);
         /*
-            * 构建用于rdma通讯的对等buffer
             SymBuffer(void* &gbl_ptr, int num_elems, int num_ranks, int sm_id = 0, int num_sms = 1)
-            * num_elems=NUM_MAX_NVL_PEERS + num_rdma_experts + 1=8+32+1=41，即这个对等buffer里，存了41个整型指针，分别指向 每个 rdma_rank 上的 buffer 地址; 每个rdma_rank 上的 nexperts
-            * kNumRDMARanks=8
+            * num_elems=NUM_MAX_NVL_PEERS + num_rdma_experts + 1=8+32+1=41，主要是3类信息：
+                1. token_counts per nvl_rank，共8个
+                2. token_counts per expert，共 num_rdma_experts(32) 个
+                3. 当前rdma_rank 上token_Counts
             * 注意，这里使用 sm_id==0, num_sm==1 来创建 SymBuffer，对所有 rdma_rank 可见 
         */
 
@@ -172,41 +173,30 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
 
         // Copy to send buffer
         /* 
-            3. 填充 send_buffer，统计自己(rank)会往远端rdma_ranks 发送的tokens 统计信息，包括:
-                1. 发送给远端 rdma_rank 对应 8个nvl_peer 的tokens 数, e.g.  num_tokens_per_rank[i]
-                2. 发送给远端 rdma_rank 上32个experts 的tokens 数，e.g. num_tokens_per_expert[i]
-                3. 发送给远端 rdma_rank 上 总共的tokens 数，e.g. num_tokens_per_rdma_rank[thread_id];
+            3. 填充 send_buffer，统计自己(rank)会往远端rdma_ranks 发送的tokens 统计信息
         */ 
         #pragma unroll
         for (int i = thread_id; i < num_ranks; i += num_threads)
             rdma_recv_num_tokens_mixed.send_buffer(i / NUM_MAX_NVL_PEERS)[i % NUM_MAX_NVL_PEERS] = num_tokens_per_rank[i];
         /*
+            给 token_counts per nvl_rank 赋值
             rdma_rank_idx = i / NUM_MAX_NVL_PEERS
             local_rank_idx = i % NUM_MAX_NVL_PEERS，即当前rank/gpu，在节点内 local 索引
-            实际效果，当前 rdma_rank 向 symBuffer 实例 rdma_recv_num_tokens_mixed 的 rdma_rank_idx 子缓存区域的 local_rank_idx 位置，写入 num_tokens_per_rank[i]； 
-            写完成后，由于是 symBuffer实例，所有远端 rdma_rank 都能同步access该位置的vals
-            
             注意，i+=num_threads, 即这个loop 都是以 per thread-block 为单位进行的，亦即物理上对应sm0
         */
         #pragma unroll
         for (int i = thread_id; i < num_experts; i += num_threads)
             rdma_recv_num_tokens_mixed.send_buffer(i / num_rdma_experts)[NUM_MAX_NVL_PEERS + i % num_rdma_experts] = num_tokens_per_expert[i];
         /*
+            * 给 token_coutns per rdma_expert 赋值
             * rdma_rank_idx =  i / num_rdma_experts，即当前 i-th expert 落在哪个 rdma_rank 上
             * local_expert_idx = i % num_rdma_experts，即当前 i-th expert 在当前 rdma_rank 上的局部索引
-            实际效果：当前 rdma_rank 向 symBuffer 实例 rdma_recv_num_tokens_mixed 的 rdma_rank_idx 子缓冲区域中的 local_expert_idx 位置，写入 num_tokens_per_expert[i]；
-            写完后，所有远端 rdma_rank 都能同步access 该位置的vales
         */
         if (thread_id < kNumRDMARanks)
             rdma_recv_num_tokens_mixed.send_buffer(thread_id)[NUM_MAX_NVL_PEERS + num_rdma_experts] = num_tokens_per_rdma_rank[thread_id];
         __syncthreads();
         /*
-            实际效果：当前 rdma_rank 向 symBuffer 实例 rdma_recv_num_tokens_mixed[thread_idx] 子缓冲区域中的第 40(NUM_MAX_NVL_PEERS + num_rdma_experts)个位置，
-            写入  num_tokens_per_rdma_rank[thread_id]; 
-        */
-
-        /*
-            TODO: 不是 symBuffer 就是所有 rdma_rank 可见的嘛？为什么还需要再 send_buffer(i) 写 recv_buffer(rdma_rank) ??
+            给 tokens_counts per rdma_rank 赋值
         */
 
         // Issue send
@@ -218,6 +208,9 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
                                                 reinterpret_cast<uint64_t>(rdma_recv_num_tokens_mixed.send_buffer(i)),
                                                 (NUM_MAX_NVL_PEERS + num_rdma_experts + 1) * sizeof(int),
                                                 translate_dst_rdma_rank<kLowLatencyMode>(i, nvl_rank), 0, lane_id, 0);
+                /*
+                    将本地 send_buffer 中数据广播给所有其他 rdma_rank 的recv_buffer 中。
+                */
             } else { 
                 UNROLLED_WARP_COPY(1, lane_id, NUM_MAX_NVL_PEERS + num_rdma_experts + 1, 
                                     rdma_recv_num_tokens_mixed.recv_buffer(rdma_rank), 
@@ -673,6 +666,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
     auto rdma_channel_meta = SymBuffer<int>(rdma_buffer_ptr, NUM_MAX_NVL_PEERS * 2 + 2, kNumRDMARanks, channel_id, num_channels);
     auto rdma_channel_head = SymBuffer<uint64_t, false>(rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
     auto rdma_channel_tail = SymBuffer<uint64_t, false>(rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
+//  auto rdma_recv_num_tokens_mixed = SymBuffer<int>(rdma_buffer_ptr, NUM_MAX_NVL_PEERS + num_rdma_experts + 1, kNumRDMARanks);
     /*
         * num_bytes_per_rdma_token
             * token hidden_bytes 7168
@@ -686,14 +680,26 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         * SymBuffer(gbl_ptr, num_elems, num_ranks, sm_id=0, nums_sm=1)
         * rdma_channel_data[channel_i].send_ptr 首地址:  gbl_ptr + num_max_rdma_chunked_recv_tokens * num_bytes_per_rdma_token * kNumRDMARanks * channel_i 
         * rdma_channel_data[channel_i].recv_ptr 首地址:  gbl_ptr + num_max_rdma_chunked_recv_tokens * num_bytes_per_rdma_token * kNumRDMARanks * ( channel_i + num_channels)
-        * rdma_channel_meta[channel_i].send_ptr 首地址: gbl_ptr + (NUM_MAX_NVL_PEERS * 2 + 2) * kNumRDMARanks * channel_id 
-        * rdma_channel_meta[channel_i].recv_ptr 首地址: gbl_ptr + (NUM_MAX_NVL_PEERS * 2 + 2) * kNumRDMARanks * ( channel_id + num_channels)
-        * rdma_channel_head[channel_i].send_ptr 首地址： gbl_ptr + 1*kNumRDMARanks*channel_id 
-        * rdma_channel_head[channel_i].recv_ptr 首地址： gbl_ptr + 1*kNumRDMARanks* ( channel_id + num_channels)
-        * rdma_channel_tail[channel_i].send_ptr 首地址： gbl_ptr + 1*kNumRDMARanks*channel_id 
-        * rdma_channel_tail[channel_i].recv_ptr 首地址： gbl_ptr + 1*kNumRDMARanks* ( channel_id + num_channels)        
 
-        TODO: head/tail 指针怎么用的？？ 
+        * 理解下这里 rdma_channel_meta 为什么是  num_nvl_peers *2 + 2 个元素:
+            1. 节点内 peer GPU 上的token range 的 start/end ptr 
+                * 前 num_nvl_peers 个元素，对应 每个 peer GPU 上(发送??)tokens 的起始位置(负值编码)
+                * 后 num_nvl_peers 个元素，对应 每个 peer GPU 上(发送??)tokens 的结束位置(负值编码)
+            2. channel-level gbl tokens range 的 start/end ptr
+                * [-2] 为当前channel 上 gbl token 起始位置
+                * [-1] 为当前channel 上 gbl token 结束位置
+            3. 为什么rdma_channel_meta 需要知道 nvl_peer 上 tokens start/end ? rdma 分发后实际会落到具体nvl gpu上
+        
+        * 理解下 head/tail ptr ？
+            1. per channel 维护独立的 head/tail 指针
+            2. rdma_channel_tail
+                * 生产者(发送方)维护的指针，指向下一个待写入的位置
+                * 消费者通过比较 `tail - head` 判断待处理数据量
+                * 通过 `st_release()` 更新
+            3. rdma_channel_head
+                * 消费者(接收方)维护的指针，指向最后一个已确认处理的数据位置
+                * 生产者通过比较 `tail - head` 判断buffer 剩余空间
+                * 通过原子操作跟新 `nvshmemi_ibgda_amo_nonfetch_add()` 
     */
 
     // NVL buffer layouts

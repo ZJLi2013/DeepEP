@@ -445,7 +445,7 @@ barrier_block(int** barrier_signal_ptrs, int rank) {
 
     /*
         目标: inter-tblock 同步 跨多gpu/ranks 使用 pairwise 信号机制 ？？
-        * barrier_signal_ptrs[nvl_rank]
+        * barrier_signal_ptrs[nvl_ranks][nvl_ranks]
         * kNumRanks 在 internode.cu 中为 NUM_MAX_NVL_PEERS(8)
     */
 
