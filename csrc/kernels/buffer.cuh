@@ -25,6 +25,11 @@ public:
         gbl_ptr = reinterpret_cast<uint8_t*>(gbl_ptr) + total_bytes;
         return *this;
     }
+    /*
+        Buffer.ptr = nvl_recv_buffer # 注意 .ptr 是该Buffer 实例本身的buffer
+        而 gbl_ptr 并不是Buffer实例自身的ptr，而是外部的ptr。
+        advance_also() 是将 外部 gbl_ptr 向前移动 total_bytes 位置，返回该buffer实例的副本
+    */
 
     __device__ __forceinline__ dtype_t* buffer() {
         return reinterpret_cast<dtype_t*>(ptr);
@@ -54,6 +59,11 @@ public:
         ptrs[0] = reinterpret_cast<uint8_t*>(gbl_ptr) + per_channel_bytes * sm_id + num_bytes * offset;
         gbl_ptr = reinterpret_cast<uint8_t*>(gbl_ptr) + total_bytes;
     }
+    /*
+        同Buffer，SymBuffer，这里也维护了两个指针:
+            * ptrs，为该AsymBuffer 实例自身ptrs
+            * gbl_ptr 为该AsymBuffer 所在外部全局Buffer 上的指针。该外部全局Buffer 上可以放多个 Buffer, AsymBuffer, SymBuffer 等实例，gbl_ptr 用于统一管理。
+    */
 
     __device__ __forceinline__ AsymBuffer(void** gbl_ptrs, int num_elems, int num_ranks,
                                           int sm_id = 0, int num_sms = 1, int offset = 0) {
@@ -81,6 +91,11 @@ public:
         gbl_ptr = reinterpret_cast<uint8_t*>(gbl_ptr) + total_bytes;
         return *this;
     }
+    /*
+        “用当前 AsymBuffer 对象的大小来推进外部的 gbl_ptr，然后返回当前对象本身，便于链式处理。”
+        这个函数是“无副作用的”（不改自己状态，只改外部指针），相当于内存布局时的“跳过当前块”的工具函数。
+        * 返回 *this 使得你可以做链式调用，方便你进行 连续多个 buffer 的处理。
+    */
 
     template<int kNumAlsoRanks>
     __device__ __forceinline__ AsymBuffer advance_also(void** gbl_ptrs) {

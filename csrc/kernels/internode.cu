@@ -237,21 +237,37 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
         // NVL buffers
         auto nvl_send_buffer = thread_id < NUM_MAX_NVL_PEERS ? buffer_ptrs[thread_id] : nullptr;
         auto nvl_recv_buffer = buffer_ptrs[nvl_rank];
+        /*
+            当前nvl_rank 发/收 的buffer 地址 :   buffer_ptrs[nvl_rank]
+        */
         auto nvl_reduced_num_tokens_per_expert = Buffer<int>(nvl_recv_buffer, num_rdma_experts).advance_also(nvl_send_buffer);
+        /*
+            * nvl_reduce_num_tokens_per_expert 缓存，以 nvl_recv_buffer 为内部ptr，该buffer 长度 num_rdma_experts(32) * sizeof(int)
+            * 完成分配后，gbl_ptr(nvl_recv_buffer) 前移为后续 buffer 指针用
+            * 作用: 本地(nvl_rank) 存储当前 rdma_rank 上所有experts 通过rdma 从全局(all nodes）接收的tokens 数。
+            * 从globa level，即每个 nvl_rank 都有自己的 nvl_reduced_num_tokens_per_expert[num_rdma_experts]
+            * 当前nvl_rank 为什么需要存储 token_reduced_per_expert ?
+                * 主要是让本地 nvl_rank 知道其自身所有的experts 需要处理的tokens 数，而不需要查询操作。
+        */
         auto nvl_send_num_tokens_per_rank = AsymBuffer<int>(nvl_send_buffer, kNumRDMARanks, NUM_MAX_NVL_PEERS);
+        /*
+            以 nvl_send_buffer 为base，分配 kNumRDMARanks * NUM_MAX_NVL_PEERS * sizeof(int) 区段 给 nvl_send_num_tokens_per_rank
+            注意，这个AsymBuffer 的模板 kNumRanks==1，即其内部指针 ptrs[0] 只有一个元素
+            * 完成分配后，gbl_ptr 前移 kNumRDMARanks * NUM_MAX_NVL_PEERS * sizeof(int) 位，为后续 buffer 指针用
+            * 目的: 当前nvl_rank 发往其他各个 rdma_rank 组的 tokens 数统计
+        */
         auto nvl_send_num_tokens_per_expert = AsymBuffer<int>(nvl_send_buffer, num_nvl_experts, NUM_MAX_NVL_PEERS);
+        /*
+            per nvl_rank 发往其自身4个experts 上的tokens 数
+        */
         auto nvl_recv_num_tokens_per_rank = AsymBuffer<int>(nvl_recv_buffer, kNumRDMARanks, NUM_MAX_NVL_PEERS);
+        /*
+            per nvl_rank 从各个 rdma_rank 接收的tokens 数
+        */
         auto nvl_recv_num_tokens_per_expert = AsymBuffer<int>(nvl_recv_buffer, num_nvl_experts, NUM_MAX_NVL_PEERS);
         /*
-        这些变量定义了 comm_buffers 用于在节点内gpu 之间交换 tokens 统计信息
-            * nvl_send_buffer , 只有 thread0-7 使用
-            * nvl_recv_buffer ，每个nvl_rank 接收buffer 指针
-            * nvl_reduced_num_tokens_per_expert ，per expert 上 aggregated tokens 数目
-            * nvl_send_num_tokens_per_rank ，per rdma_rank 发送出去的 tokens 数目
-            * nvl_send_num_tokens_per_expert , per expert 发送出去的 tokens 数目
-            * nvl_recv_num_tokens_per_rank ， per rdma_rank 接收到的 tokens 数目
-            * nvl_recv_num_tokens_per_expert ， per expert 接收到的 tokens 数目
-        * 注意， AsymBuffer.buffer() 仅用于 single rdma_rank case 
+            per nvl_rank 上各个 experts 接收的tokens 数
+            * nvl_recv_num_tokens_per_expert 和 nvl_send_num_tokens_per_expert 的区别?  
         */
 
         // Clean up for later data dispatch
@@ -270,12 +286,15 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
             #pragma unroll
             for (int i = 0; i < kNumRDMARanks; ++ i)
                 sum += rdma_recv_num_tokens_mixed.recv_buffer(i)[NUM_MAX_NVL_PEERS + thread_id];
-            nvl_reduced_num_tokens_per_expert[thread_id] = sum; // 跟新 expert_i 上 reduce_num_tokens，其来自所有 rdma_rank 发给该expert 的tokens 总数
+            /*
+                与这里对应： rdma_recv_num_tokens_mixed.send_buffer(i / num_rdma_experts)[NUM_MAX_NVL_PEERS + i % num_rdma_experts] = num_tokens_per_expert[i];
+                sum 即为所有 rdma_rank 发往该 expert_i 的tokens 总数
+            */
+            nvl_reduced_num_tokens_per_expert[thread_id] = sum; 
         }
         /*
             * per thread per expert counter
             * sm0 上 thread_i 去collect 从各个 rdma_rank 要发送给 expert_i 的tokens，并 reduce sum
-            * TODO: 这里需要可视化理解下，前述 send_buffer(),  nvshmem_ibdga_put() 等操作与这里 recv_buffer() 的对应关系 
         */
         __syncthreads();
 
@@ -315,8 +334,8 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
             for (int i = 0; i < num_nvl_experts; ++ i)
                 nvl_send_num_tokens_per_expert.buffer(nvl_rank)[i] = nvl_reduced_num_tokens_per_expert[thread_id * num_nvl_experts + i];
             /*
-                nvl_send_num_tokens_per_expert.buffer() 类似一个 8x4 指针，per nvl_rank dim, 包含指向4个 expert 上的tokens 统计的指针。如下:
-                *  同理，ipc 通信，从 当前 nvl_rank 所对应 rdma_rank 发送到所有其他 rdma_rank 上相同 local gpu_idx 上的 4x experts, each expert 上的tokens 数目
+                相当于将 nvl_reduced_num_tokens_per_expert[num_rdma_experts] ->  nvl_reduced_num_tokens_per_expert[num_nvl_peers][num_nvl_experts]
+                而 nvl_reduced_num_tokens_per_expert[nvl_rank_idx] 即 nvl_send_num_tokens_per_expert
             */
         }
         /*
@@ -743,16 +762,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
     auto nvl_channel_head = AsymBuffer<int>(rs_wr_buffer_ptr, 1, NUM_MAX_NVL_PEERS, channel_id, num_channels, ws_rr_rank).advance_also(ws_rr_buffer_ptr);
     auto nvl_channel_tail = AsymBuffer<int>(ws_rr_buffer_ptr, 1, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank).advance_also(rs_wr_buffer_ptr);
     /*
-        * ws_rr_buffer_ptr 指向 target_rank ipc， 即 ipc ranks  
-        * rs_wr_buffer_ptr 指向 src_rank buffer ，即 current nvl_rank 读取(read)自己的 send_buffer 以发送(send)到远端 target_ranks 的 recv_buffer 
-
         * AsymBuffer(gbl_ptr, num_elems, num_ranks, sm_id = 0, num_sms = 1, offset = 0)
-
-        * nvl_channel_x[channel_id][rs_wr_rank].ptrs[0] 首地址， ws_rr_buffer_ptr[0] + num_bytes * NUM_MAX_NVL_PEERS * channel_id + num_bytes * rs_wr_rank 
-        * nvl_channel_x[channel_id][rs_wr_rank].ptrs[1] 首地址， ws_rr_buffer_ptr[1] + num_bytes * NUM_MAX_NVL_PEERS * channel_id + num_bytes * rs_wr_rank 
-        * ..
-        * nvl_channel_x[channel_id][rs_wr_rank].ptrs[7] 首地址， ws_rr_buffer_ptr[7] + num_bytes * NUM_MAX_NVL_PEERS * channel_id + num_bytes * rs_wr_rank 
-        * 同理 for  nvl_channel_src_meta, x_scales, topk_idx, topk_weights
         
         #######################
         * nvl_channel_prefix_start/end  用来 coordinate token transfers 在gpu peers 之间

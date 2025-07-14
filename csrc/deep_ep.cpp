@@ -68,6 +68,11 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
 
         // // 缓冲区指针数组起始位置
         buffer_ptrs_gpu = reinterpret_cast<void**>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes + barrier_signal_bytes);
+        /*
+            1. 总buffer =  data_buffer + barrier_signals + buffer_ptrs + barrier_signal_ptrs 
+            2. 从这块大 buffer 中，跳过 data + barrier_signal 的部分，将接下来的区域（即 buffer_ptrs ..）解释为一个 void** 指针。
+                * 亦即，将大buffer 中第 3块区域** 作为 void**  
+        */
         // Set barrier signals
         barrier_signal_ptrs[nvl_rank] = reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes);
         // barrier指针数组起始位置
@@ -260,7 +265,15 @@ void Buffer::sync(const std::vector<int> &device_ids,
 
         // Copy all buffer and barrier signal pointers to GPU
         CUDA_CHECK(cudaMemcpy(buffer_ptrs_gpu, buffer_ptrs, sizeof(void*) * NUM_MAX_NVL_PEERS, cudaMemcpyHostToDevice));
+        /*
+            * buffer_ptrs，为 host 上的一个数组：void* buffer_ptrs[NUM_MAX_NVL_PEERS]，每个元素记录 peer GPU 的 buffer 地址（device pointer）
+            * 将 peer_gpu buffer 地址 `buffer_tprs[nvl_rank]` 复制到当前 nvl_rank 大buffer 的第3块区域中。
+                * 这样每个gpu 都可以找到所有peer_gpu 上buffer 地址，方便后续p2p  
+        */
         CUDA_CHECK(cudaMemcpy(barrier_signal_ptrs_gpu, barrier_signal_ptrs, sizeof(int*) * NUM_MAX_NVL_PEERS, cudaMemcpyHostToDevice));
+        /*
+            同理buffer_ptrs_gpu，其才是peer_gpus 上 barrier_signal 的内存地址
+        */
         CUDA_CHECK(cudaDeviceSynchronize());
     }
 
