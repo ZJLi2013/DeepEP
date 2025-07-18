@@ -390,7 +390,7 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
         /*
             * 见 https://zhuanlan.zhihu.com/p/1890067712996270654
             * 在 internode::notify_dispatch 中启用了9个 SM block计算, SM0 用 rdma通信和ipc通信来统计要接受和发送的信息。sm1~8 则统计channel（通道）粒度的内容
-                * 使用8个sm block，每个sm block使用8个warp, 256个线程, 统计10个通道的发送信息，最终填充到rdma_channel_prefix_matrix， gbl_channel_prefix_matrix两个矩阵中。
+                * 使用8个sm block，每个sm block使用8个warp, 256个线程, 统计10个通道的发送信息，最终填充到 rdma_channel_prefix_matrix ， gbl_channel_prefix_matrix 两个矩阵中。
             * 在 internode::dispatch 使用20个SM， 分成10个channel。 此时将待发送tokens顺序切分成10份，计算每份（通道）发送到远端rank, rdma_rank的token数量
         */
         // Calculate meta data
@@ -405,45 +405,69 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
             is_token_in_rank[ntokens, nranks]
         */
         int dst_rdma_rank = sm_id - 1;   // sm_id 1~8 ，每个sm 对应一个 rdma_rank 
+        /*
+            这里使用 8x sms 做 channel粒度的tokens 统计
+            sm1 -> dst_rdma_rank=0
+            sm2 -> dst_rdma_rank=1
+            ..
+            sm8 -> dst_rdma_rank=7 
+            每个sm 内又分别由 8个warp 来处理10个channels，采用轮询来保证负载均衡。如下: 
+        */
         for (int channel_id = warp_id; channel_id < num_channels; channel_id += num_warps) {
+            /*
+                warp0 -> channel0, 8
+                warp1 -> channel1, 9
+                warp2 -> channel2 
+                ..
+                warp7 -> channel7 
+            */
             int token_start_idx, token_end_idx;
             get_channel_task_range(num_tokens, num_channels, channel_id, token_start_idx, token_end_idx); // 获取到当前warp需要处理token的[起始地址, 结束地址)
             /*
                 * ntokens 维度上拆分成 10x channels，每个 channel 对应由一个 warp 负责发送/接收
-                per warp 对应 per channel 上 tokens 处理。per warp 需要处理 1个或多个 channel
-                per lane 对应 per token 处理
             */
             // Iterate over tokens
             int total_count = 0, per_nvl_rank_count[NUM_MAX_NVL_PEERS] = {0};
             for (int64_t i = token_start_idx + lane_id; i < token_end_idx; i += 32) {
+                /*
+                    lane0:  token_start_idx(tsi), tsi+32, ..
+                    lane1: tsi+1， tsi+33, ..
+                    ..
+                    lane31: tsi+31
+                */
                 EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) == sizeof(uint64_t), "Invalid number of NVL peers");
                 auto is_token_in_rank_uint64 = *reinterpret_cast<const uint64_t*>(is_token_in_rank + i * num_ranks + dst_rdma_rank * NUM_MAX_NVL_PEERS);
-                auto is_token_in_rank_values = reinterpret_cast<const bool*>(&is_token_in_rank_uint64);
                 /*
-                    * is_token_in_rank + token_i * num_ranks  为当前token_i 在 is_token_in_rank 的首地址。
-                    注意当前 token_i 理论上是映射到所有8个 rdma_rank 分组上。而每个 rdma_rank 分组由一个 sm 管理，
-                    故 dst_rdma_rank * NVL_PEERS 由当前 dst_rdma_rank 负责cover 的 8个 位置(gpu_rank)，亦即在首地址基础上的偏移
+                    is_token_in_rank [ntokens, num_ranks(64）] ，即每行是一个 token 在gbl 所有 gpu_rank上是否存在。每行又可以细分成8个子组，每组8个元素。
+                    is_token_in_rank_uint64，即判断 当前token 在 dst_rdma_rank 所在子组上的存在与否
+                    * TODO: 理解这里就是 当前 token 发送到该 rdma_rank 组里的gpus上与否
                 */
+                auto is_token_in_rank_values = reinterpret_cast<const bool*>(&is_token_in_rank_uint64);
                 #pragma unroll
                 for (int j = 0; j < NUM_MAX_NVL_PEERS; ++ j)
                     per_nvl_rank_count[j] += is_token_in_rank_values[j];
                 /*
-                    由当前 dst_rdma_rank 负责cover 的 8个GPU上，是否有当前 token_i；累计当前 rdma_rank上包含当前token_i 的gpu 个数
+                    统计当前 lane-i 通过 当前 channel_id 发送到 dst_rdma_rank 上 nvl_gpus[j] 的tokens 数，是 lane 粒度的 
                 */
                 total_count += (is_token_in_rank_uint64 != 0);  
                 /*
-                    * per lane 处理的tokens，这些tokens 都会映射到 dst_rdma_rank 上的某些 gpu_rank， count 是具体哪些 gpu_ranks 上存在该 token
-                    * total_count 是当前 lane 统计的 将发送到各个 rdma_rank 上tokens 总数 
+                    统计发送到 当前 dst_rdma_rank 的 tokens 总数 (rdma_rank 粒度，即只要 token 会发送到该 rdma_rank any gpu上，都累加1)
                 */
             }
 
             // Warp reduce
-            total_count = warp_reduce_sum(total_count); // warp(channel)-level，亦即 当前 rdma_rank 将发送到各个 rdma_rank 上的 tokens 数统计，在per channel 维度上
+            total_count = warp_reduce_sum(total_count); 
+            /*
+                for loop 处说明 per lane 由轮询选举要处理的token_idx
+                warp_reduce_sum() 是当前warp（亦即当前 channel_id) 发送到 dst_rdma_rank 的 tokens 总数
+                    * 不同warp 处理不同的channel
+                    * 同一个sm 内的8个warp 只面向同一个 dst_rdma_rank
+            */
             #pragma unroll
             for (int i = 0; i < NUM_MAX_NVL_PEERS; ++ i)
                 per_nvl_rank_count[i] = warp_reduce_sum(per_nvl_rank_count[i]);
             /*
-                当前 rdma_rank 其上各个 nvl_rank 将要发送出去的 tokens 统计
+                统计当前 warp 通过 当前 channel_id 发送到 dst_rdma_rank 上 nvl_gpus[j] 的tokens 数，是 warp 粒度的
             */
 
             // Write into channel matrix
@@ -454,10 +478,10 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
                 rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id] = total_count;
             }
             /*
-                gbl_channel_prefix_matrix[num_ranks, num_channels] # [64, 10]
-                    * (dst_rdma_rank * NUM_MAX_NVL_PEERS + i) * num_channels 当前 channel_id 的首地址
-                * 基本就是 per sm_id 处理 per dst_rdma_rank，其对应 gbl_channel_prefix_matrix 中连续8行。每行又细分成 10x channels 
+                * gbl_channel_prefix_matrix[num_ranks, num_channels] # [64, 10]
+                    * 当前 warp（当前channel_id) 发送到 dst_rdma_rank per nvl_rank 上的tokens 数
                 rdma_channel_prefix_matrix[num_rdma_ranks, num_channels] #[8,10]
+                    * 当前warp（亦即当前 channel_id) 发送到 dst_rdma_rank 的 tokens 总数
             */
         }
 
@@ -619,7 +643,6 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 * 从 nvlink buffer 读取数据 (nvl_channel_x)
                 * 执行数据聚合 combine_token()
                 * 管理 combined_x, combined_topk_weights 输出buffer
-        TODO 
     */
 
     const auto num_sms = static_cast<int>(gridDim.x);
@@ -668,7 +691,9 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
     }();
     /*
         * role_meta 返回 <warpRole，target_rank> 序列
-        * TODO: 每个 warpRole 对应的 target_ranks 
+
+
+
     */
     auto warp_role = role_meta.first;
     auto target_rank = role_meta.second; // Not applicable for RDMA senders
@@ -685,7 +710,6 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
     auto rdma_channel_meta = SymBuffer<int>(rdma_buffer_ptr, NUM_MAX_NVL_PEERS * 2 + 2, kNumRDMARanks, channel_id, num_channels);
     auto rdma_channel_head = SymBuffer<uint64_t, false>(rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
     auto rdma_channel_tail = SymBuffer<uint64_t, false>(rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
-//  auto rdma_recv_num_tokens_mixed = SymBuffer<int>(rdma_buffer_ptr, NUM_MAX_NVL_PEERS + num_rdma_experts + 1, kNumRDMARanks);
     /*
         * num_bytes_per_rdma_token
             * token hidden_bytes 7168
@@ -763,26 +787,9 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
     auto nvl_channel_tail = AsymBuffer<int>(ws_rr_buffer_ptr, 1, NUM_MAX_NVL_PEERS, channel_id, num_channels, rs_wr_rank).advance_also(rs_wr_buffer_ptr);
     /*
         * AsymBuffer(gbl_ptr, num_elems, num_ranks, sm_id = 0, num_sms = 1, offset = 0)
-        
-        #######################
-        * nvl_channel_prefix_start/end  用来 coordinate token transfers 在gpu peers 之间
-         
-        TODO 
-
-        ######################## 
-        * nvl_channel_head 用来记录 read(head)消费者从 nvl_buffer 中读取的位置
 
         [ Channel 0 ] [ Channel 1 ] ... [ Channel 9 ]
         ^-- Per channel has 8 head pointers (one per GPU peer)
-
-        * 双指针 rs_wr_buffer_ptr 和 ws_rr_buffer_ptr 的使用：
-
-        * 对于 生产者GPU：
-            * write to ws_rr_buffer_ptr (receiver's buffer)
-            * read from rs_wr_buffer_ptr (own buffer)
-        * 对于消费者GPU:
-            * read from rs_wr_buffer_ptr (sender's buffer)
-            * write to ws_rr_buffer_ptr (own buffer)
     */
 
     // RDMA sender warp synchronization
@@ -792,13 +799,16 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
     __shared__ int rdma_send_channel_tail[kNumRDMARanks];
     __shared__ uint32_t rdma_send_channel_window[kNumRDMARanks];
     auto sync_rdma_sender_smem = []() { asm volatile("bar.sync 0, %0;" :: "r"((kNumDispatchRDMASenderWarps + 1) * 32)); };
+    /*
+        TODO: 怎么理解  kRDMASender 的 warp 同步 ??
+    */
 
     // Forward warp synchronization
     __shared__ volatile int forward_channel_head[NUM_MAX_NVL_PEERS][kNumRDMARanks];
     __shared__ volatile bool forward_channel_retired[NUM_MAX_NVL_PEERS];
     auto sync_forwarder_smem = []() { asm volatile("bar.sync 1, %0;" :: "r"((NUM_MAX_NVL_PEERS + 1) * 32)); };
     /*
-        TODO: 
+        TODO: kRDMAAndNVLForwarder 的 warp 同步 ?? 
     */
 
     if (warp_role == WarpRole::kRDMASender) {
@@ -813,8 +823,6 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
 
         // Send number of tokens in this channel by `-value - 1`
         /*
-            * 由8个warp，每个warp处理一个远端 rdma_rank。
-
             1.  rdma_channel_meta 的 buffer 选择
                 * 当目标rank 就是本rank，则使用 recv_buffer(避免自发送)
                 * 当目标rank 是其他Rank，则使用 send_buffer 
@@ -830,7 +838,19 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         */
         EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * 2 + 2 <= 32, "Invalid number of NVL peers");
         for (int dst_rdma_rank = warp_id; dst_rdma_rank < kNumRDMARanks; dst_rdma_rank += kNumDispatchRDMASenderWarps) {
+            /*
+                首先，RDMARender 由奇数组sms 上 warp0~6 执行.
+                该loop 表示: 
+                    warp0 -> dst_rdma_rank=0, 7
+                    warp1 -> dst_rdma_rank=1
+                    ..
+                    warp6 -> dst_rdma_rank=6
+            */
             auto dst_ptr = dst_rdma_rank == rdma_rank ? rdma_channel_meta.recv_buffer(dst_rdma_rank) : rdma_channel_meta.send_buffer(dst_rdma_rank);
+            /*
+                * 如果当前 warp 要发送的目标rank `dst_rdma_rank` 是自身所在 rdma_rank，则写目标指针 dst_ptr = rdma_channel_meta.recv_buffer(dst_rdma_rank)
+                * 否则，dst_ptr = rdma_channel_meta.send_buffer(dst_rdma_rank) <== 
+            */
             if (lane_id < NUM_MAX_NVL_PEERS) {
                 dst_ptr[lane_id] = -(channel_id == 0 ? 0 : gbl_channel_prefix_matrix[(dst_rdma_rank * NUM_MAX_NVL_PEERS + lane_id) * num_channels + channel_id - 1]) - 1;
             } else if (lane_id < NUM_MAX_NVL_PEERS * 2) {
@@ -870,14 +890,17 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             uint64_t is_token_in_rank_uint64 = 0;
             if (lane_id < kNumRDMARanks) {
                 is_token_in_rank_uint64 = __ldg(reinterpret_cast<const uint64_t*>(is_token_in_rank + token_idx * num_ranks + lane_id * NUM_MAX_NVL_PEERS));
+                /*
+                        注意， notify_dispatch() 中有这个计算逻辑。但是这里使用了 __ldg()，只读数据缓存来访问 Global Memory，可以更好利用l1 cache
+                        这是常见的优化方式
+                */
                 global_rdma_tail_idx += (is_token_in_rank_uint64 != 0);
+                /*
+                
+                */
             }
             __syncwarp(); // 确保8条lane 都完成读取，在后续指向
             /*
-                * 读取跨节点分发信息，关键优化：
-                    1. 使用 __ldg() 指令 进行常量缓存读取，减少dram访问延迟
-                    2. 将 8x bool package 成 uint64 读取。 per bool 偏移计算: token_idx * num_ranks + lane_id * NUM_MAX_NVL_PEERS
-                * uint64 表示当前token 在 target rdma_rank 上8个gpu 上的分布情况 
                 * global_rdma_tail_idx 统计该token需要发送给的RDMA_ranks 的数量
                 * 这里 per lane 处理 (per token 是否要发送到) 某个 rdma_rank
             */
@@ -1187,7 +1210,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         */
         // RDMA consumers and NVL producers
         const auto dst_nvl_rank = target_rank;
-        const auto dst_rank = rdma_rank * NUM_MAX_NVL_PEERS + dst_nvl_rank; // 当前 rdma_rank 上 local nvl_rank_idx
+        const auto dst_rank = rdma_rank * NUM_MAX_NVL_PEERS + dst_nvl_rank; // 在 global rdma 视角看当前 nvl_rank 的idx  
         const auto dst_rank_expert_begin = dst_rank * (num_experts / num_ranks); // 当前 local nvl_rank 上 expert id 起始 
         const auto dst_rank_expert_end = dst_rank_expert_begin + (num_experts / num_ranks); // 当前 local nvl_rank 上 expert id 终点 // TODO: expert id 在各个gpu上连续 ?
 
