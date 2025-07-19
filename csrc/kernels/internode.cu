@@ -886,36 +886,43 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 2. 否则，就是当前channel 的 send_buffer + lane_id 偏移
         */
         for (token_idx = token_start_idx; token_idx < token_end_idx; ++ token_idx) {
+            /*
+                注意，这里跟 notify_dispatch() 中loop 逻辑不太一样。前者是 per lane 处理 tokens。
+                这里是当前 warp 中所有 lanes(实际只有前 8x lanes) 都参与当前 token 的处理，但是 per lane 会处理该token 与某个 tgt_rdma_rank 的对应
+            */
             // Read RDMA rank existence
             uint64_t is_token_in_rank_uint64 = 0;
-            if (lane_id < kNumRDMARanks) {
+            if (lane_id < kNumRDMARanks) {  // per lane 负责 当前 token --> rdma_rank
                 is_token_in_rank_uint64 = __ldg(reinterpret_cast<const uint64_t*>(is_token_in_rank + token_idx * num_ranks + lane_id * NUM_MAX_NVL_PEERS));
                 /*
                         注意， notify_dispatch() 中有这个计算逻辑。但是这里使用了 __ldg()，只读数据缓存来访问 Global Memory，可以更好利用l1 cache
-                        这是常见的优化方式
+                        这是常见的优化方式：前面算过后，这里使用 __ldg()
+                        注意，这里 per lane 负责一个 tgt_rdma_rank， 即管理当前 token 是否会发送到某个 tgt_rdma_rank
                 */
                 global_rdma_tail_idx += (is_token_in_rank_uint64 != 0);
                 /*
-                
+                    global_rdma_tail_idx 标记当前 rdma_rank 当前channel_id 上，一共发送去 tgt_rdma_rank 的 tokens 数目。
+                    注意，这里是并行的 8x lanes，即每个 lane(对应一个 tgt_rdma_rank-jth) 上都有一个 local global_rdma_tail_idx， \
+                        * 表示从当前 rdma_rank 当前 channel_id 所有发往 tgt_rdma_rank-jth 的 tokens 数目
                 */
             }
             __syncwarp(); // 确保8条lane 都完成读取，在后续指向
-            /*
-                * global_rdma_tail_idx 统计该token需要发送给的RDMA_ranks 的数量
-                * 这里 per lane 处理 (per token 是否要发送到) 某个 rdma_rank
-            */
 
             // Skip the token which does not belong to this warp
             if ((token_idx - token_start_idx) % kNumDispatchRDMASenderWarps != warp_id)
                 continue;
             /*
-                每个 warp 处理 的token list:   warp_id, warp_id+7, warp_id+14, ...
-                这里 bypass 不属于当前warp 要处理的 tokens
+                另外，从这个逻辑可以看到，当前channel 上要处理的 tokens 仍然是在 warp-level 做了轮询，以负载均衡。
+                * RDMASender 使用了 奇数组sms 中，每个sm 的前7个warps。
+                    * warp0 处理 token_start_idx(tsi), tsi+7, ...
+                    * warp1 处理 tsi+1, tsi+2, ..
+                    * ..
+                    * warp6 处理 tsi+6, .. 
             */
             auto rdma_tail_idx = is_token_in_rank_uint64 == 0 ? -1 : global_rdma_tail_idx - 1;
             /*
-                 * 若当前token 不需要发送给 当前 rdma_rank， 则 tail_idx = -1 (无效索引)
-                 * 若当前 token 需要发送给 当前 rdma_rank，则 tail_idx 为实际尾指针(glb_rdma_tail_idx-1)
+                如果当前 rdma_rank 不需要发送tokens 给到 tgt_rdma_rank，则当前rdma_rank 上的 tail 指针不动；
+                否则， rdma_tail_idx 用 当前 rdma_rank 通过 channel_id 发往  tgt_rdma_rank-jth 的tokens 数目 -1 跟新 
             */
             // Wait the remote buffer to be released
             auto start_time = clock64();
@@ -931,10 +938,10 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             }
             /*
                 1. 通过使用 RingBuffer，发送端只维护 tail_ptr, 而接收端只维护 head_ptr，即可实现无锁设计
+                    * rdma_tail_idx 在本地 rdma_rank，即本地 rdma_rank 维护 tail 指针的更新 
                 2. 通过在发送端维护 head_ptr 的副本 cached_rdma_channel_head，减少频繁 head_ptr 读取。
-                只有当`tail_ptr - cached_head_ptr >= 缓冲区大小`时，才更新该 cached_rdma_channel_head
-                
-                TODO: rdma_tail_idx 貌似针对所有 rdma_rank 都是一个？？
+                    * 而 cached_rdma_channel_head 是 本地rdma_rank 上维护的 远端 rdma_channel_head 的副本
+                    * 当本地`tail_ptr - cached_head_ptr >= 缓冲区大小`时，需要跟新该副本
             */
             __syncwarp();
 
@@ -942,12 +949,11 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             if (lane_id < kNumRDMARanks and not kCachedMode)
                 send_rdma_head[token_idx * kNumRDMARanks + lane_id] = rdma_tail_idx;
             /*
-                * rdma_tail_idx，当前token 在 target rdma_rank rdma_buffer 中的写入位置
-                * send_rdma_head [ntokens, num_rdma_ranks] # 这里 lane_id 与 n_rdma_rank_idx 等价
-                所以，这里实际上是 token_idx 在 lane_id 个 rdma_rank 上的 rdma_head 指针更新?
-
-                * 根据baseline dispatch/combine 理解
-                    send_rdma_head[]= rdma_tail_idx， 即 location_in_expert，描述当前token_idx 在当前Expert(rdma_rank)的batch 中的位置
+                * send_rdma_head [ntokens, num_rdma_ranks] 
+                    * 其保存 当前 rdma_rank 通过 channel_id 发往 tgt_rdma_rank-jth 的 tokens 数目。
+                    * 对于8组 rdma_ranks， 即per token_idx 有 len(send_redma_haed[token_id, :])=8
+                // * 根据baseline dispatch/combine 理解
+                //     send_rdma_head[]= rdma_tail_idx， 即 location_in_expert，描述当前token_idx 在当前Expert(rdma_rank)的batch 中的位置
             */
 
             // Broadcast tails
@@ -957,31 +963,43 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             #pragma unroll
             for (int i = 0, slot_idx; i < kNumRDMARanks; ++ i) if ((slot_idx = __shfl_sync(0xffffffff, rdma_tail_idx, i)) >= 0) {
                 /*
-                    __shfl_sync() 扫描所有rdma_rank 的 tail_ptr，当前 rdma_rank_i 上 tail_ptr 指针有效，则继续
-                    __shfl_sync() 实现 warp 内 0周期的数据交换；每个线程获取其他线程的tail位置；确保无锁情况下，多线程写入缓冲区不同位置
+                    这里 per lane 对应 token_i 是否发往 tgt_rdma_rank-jth
+                    * 实际这里只针对前8lanes， 后面的lanes rdma_tail_idx=-1。即只要前8个lane 中存在 rdma_tail_idx >= 0 ，就有效
+                        * 这里 slot_idx 就是 某个local lane 上的  rdma_tail_idx 
+                        * __shfl_sync() 实现 warp 内 0周期的数据交换；每个线程获取其他线程的tail位置；确保无锁情况下，多线程写入缓冲区不同位置
                 */                
-                slot_idx = slot_idx % num_max_rdma_chunked_recv_tokens;
-                // 当前 rdma_rank 上 ring_buffer 的槽位。取余，可以实现无锁环形队列，避免buffer溢出
-                topk_ranks[num_topk_ranks] = i; // 将当前 rdma_rank_idx(i) 记录到 当前 token 的 topk 中 
-                auto recv_is_token_in_rank_uint64 = broadcast(is_token_in_rank_uint64, i);
+                slot_idx = slot_idx % num_max_rdma_chunked_recv_tokens; // 当前 rdma_rank 上 ring_buffer 的槽位。取余，可以实现无锁环形队列，避免buffer溢出
+                topk_ranks[num_topk_ranks] = i; 
+                /*
+                    TODO？ 
+                */
+                auto recv_is_token_in_rank_uint64 = broadcast(is_token_in_rank_uint64, i); // 将 lane-i 上 is_token_in_rank_uint64 广播给所有 8 lanes 
                 auto recv_is_token_in_rank_values = reinterpret_cast<const bool*>(&recv_is_token_in_rank_uint64);
                 if (lane_id == num_topk_ranks)
                     src_meta = SourceMeta(rdma_rank, recv_is_token_in_rank_values);
                 /*
-                    将 rdma_rank_i 上的 is_token_in_rank_uint64 广播给warp内所有线程，即 lane0~7 都可以看到 lane-i 上该值
-                        * lane-i 上的 is_token_in_rank_uint64，其实就是标记当前token 是否要发送到 rdma_rank_i 上的某些gpu上
-                        * 负责其他 rdma_rank_j 的 lane_j ，拿到该信息用来注册 rdma_rank_j 上的 src_meta 
-                    注意，is_token_in_rank_uint64 只在本轮 iter 中使用。整个loop过程，每个线程只保留当前正在处理的一份 broadcast 结果
+                    * 将 (lane-i)rdma_rank_i 上的 is_token_in_rank_uint64 广播给 lane0~7 上。
+                        * 注意，is_token_in_rank_uint64 只在本轮 iter 中使用。整个loop过程，每个线程只保留当前正在处理的一份 broadcast 结果
+                    
+                    * iter-0,  num_topk_ranks==0, 此时 lane_id(0) 构造 src_meta
+                    * iter-1, num_topk_ranks==1, lane_id(1) 构造 src_meta
+                    * ..
+
                     *  对于 per token 的 topk experts，每个lane 只负责其中一个 expert 的 src_meta 
                 */
                 dst_send_buffers[num_topk_ranks ++] = reinterpret_cast<uint8_t*>(broadcast(send_buffer, i)) + slot_idx * num_bytes_per_rdma_token;
                 /*
                     * send_buffer 定义：
-                            1. 如果是 rdma_rank 本身，直接将 rdma_channel_data.recv_buffer() 设置为 send_buffer
-                            2. 否则，就是当前channel 的 send_buffer + lane_id 偏移
-                    * 这里是将 当前token 在 rdma_rank_i 上 rdma_buffer.send_buffer 中的地址广播给所有 rdma_ranks，
-                        * 其地址 = send_buffer(基地址) + 当前token 对应的槽位(slot_idx) 偏移
-                    * 也可以看到，对于在当前 rdma_rank_i 上的token, rdma_buffer 会为其准备 send_buffer, 大小为 topk * num_bytes_per_rdma_token。
+                            1. lane_id == rdma_rank , 则为 rdma_channel_data.recv_buffer(lane_id) 
+                            2. lane_id != rdma_rank ，则为 rdma_channel_data.send_buffer(lane_id)
+
+                    * case-1，当前(lane_id)rdma_rank 发往自身的 rdma_channel_data，其不需要走rdma，直接走 local copies 写入local 的 recv_buffer。
+                    * case-2，当前rdma_rank 发往远端其他 tgt_rdma_rank，则先写入 send_buffer(lane_id)，该buffer 是等待 rdma 传输的
+
+                    * 将当前 rdma_rank 上 rdma_buffer.send_buffer + slot_idx(即本地 rdma_rank 上的tail 指针)  广播给所有 rdma_ranks
+                        * 首先，slot_idx 与 远端 tgt_rdma_rank 是一一对应的
+                        * 这样所有 tgt_rdma_rank 都知道该从当前 rdma_rank send_buffer 的哪个位置(slot_idx) 开始接收数据
+                    * dst_send_buffers[num_topk_ranks ++] 即当前 rdma_rank 的 send_buffer 上将发往 tgt_rdma_rank-jth 的tokens 槽位起始点 
                 */
             }
             EP_DEVICE_ASSERT(num_topk_ranks <= kNumTopkRDMARanks);
@@ -996,12 +1014,14 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 * st_broadcast lambda 函数，将单个val同时写入多个目标 buffer
                     * `st_na_global`：非对齐的全局内存写入指令(non-atomic global memory store)
                     * `reinterpret_cast<int4*>`：指针类型转换保证内存对齐    
+                * 
             */
             UNROLLED_WARP_COPY(5, lane_id, hidden_int4, 0, x + token_idx * hidden_int4, ld_nc_global, st_broadcast);
             /*
                 per lane_id 负责拷贝 hidden_int4/32 个元素，通过循环展开和warp级并行实现
                 * UNROLLED_WARP_COPY(step, tid, count, offset, src, load, store)
                 效果就是将  st_broadcast() 的值 写入  x + 偏移
+                总结： x 在本地 rdma_rank 上，需要将其写入当前 rdma.send_buffer 中 tgt_rdma_rank 对应的位置
             */
             /*
                 ld_nc_global对应的ptx指令为 ld.global.nc.L1::no_allocate.L2::256B， 
@@ -1052,25 +1072,86 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
 
             // Release the transaction in the window
             if (is_token_in_rank_uint64 != 0) {
+                /*
+                * __shared__ int rdma_send_channel_lock[kNumRDMARanks]
+                    * 0 表示空闲；1表示被某个线程(lane-j)占据
+                    * 每个 lane_id(rdma_rank) 上一个自定义锁(int 变量)，在线程块内共享
+
+                * __shared__ int rdma_send_channel_tail[kNumRDMARanks]
+                */
                 // Acquire lock first
                 acquire_lock(rdma_send_channel_lock + lane_id);
-                auto latest_tail = rdma_send_channel_tail[lane_id];
+                /*
+                    1. 当前lane-id 尝试获取 LDS 上 (rdma_send_channel_lock + lane_id) 地址的锁。获取成功后，进入下面临界区代码:                     
+                */                
+                auto latest_tail = rdma_send_channel_tail[lane_id]; // // TODO: 貌似rdma_send_channel_tail 看不到在哪里赋值的??
                 auto offset = rdma_tail_idx - latest_tail;
+                /*
+                    2. 当前 lane-id 读取受保护变量 rdma_send_channel_tail[lane_id] 上的值，更新 offset 
+                */
                 while (offset >= 32) {
-                    release_lock(rdma_send_channel_lock + lane_id);
-                    acquire_lock(rdma_send_channel_lock + lane_id);
-                    latest_tail = rdma_send_channel_tail[lane_id];
+                    release_lock(rdma_send_channel_lock + lane_id); 
+                    acquire_lock(rdma_send_channel_lock + lane_id); 
+                    /*
+                        3. 当offset>=32，当前lane_id 释放该锁，(这样其他线程就可以访问/修改 rdma_send_channeL_tail 了)；
+                            然后再尝试获取该锁，获取成功后再更新 offset。
+                            如果offset 仍然>=32, 则当前lane-id 实际就在这里等待(spin)
+                    */
+                    latest_tail = rdma_send_channel_tail[lane_id]; 
                     offset = rdma_tail_idx - latest_tail;
                 }
+                /*
+                    TODO: latest_tail vs  rdma_tail_idx ??
+
+                */
 
                 // Release the transaction slot
                 // Add the bit and move the ones if possible
+                /*
+                    __shared__ uint32_t rdma_send_channel_window[kNumRDMARanks]
+                        * 每个 window 是 32-bit uint 作为 bitmask 用来 track the status of 32 slots in a sliding window buffer
+                        * 每个rdma_rank 有自己的 window
+                        * window 的访问/修改 需要 rdma_send_channel_lock 锁
+                */
+                // 3. 标记事务槽位可用 
                 auto window = rdma_send_channel_window[lane_id] | (1u << offset);
+                /*
+                    * 1u :  unsigned int 1 
+                    * 1u << offset 位左移操作，构成一个掩码：只有 offset 位是1，其他位都是0
+                    * | 按位或:   window = window | mask :: 即讲 window 中 offset 的位置置为 1，
+                    * 每个 rdm_rank 上 per channel 的 rdma事务slots 用滑窗表示，该滑窗size=32，每个槽位刚好可用 uint32 的 per bit 表示其状态:
+                        * bit==1 表示Occupied
+                        * bit==0 表示Free
+                */
+                // 4. 滑动窗口(当处理最旧事务时)
                 if (offset == 0) {
+                    /*
+                        offset==0, when processing the oldest outstanding transaction (the head of the window). 
+                        Its purpose is to reclaim buffer space by releasing contiguous free slots at the beginning of the window.
+
+                    */
                     auto num_empty_slots = (~window) == 0 ? 32 : __ffs(~window) - 1;
+                    /*
+                        * ~window，反转位图
+                        * (~window)==0 : 所有槽位都被占(反转前全1)，那么跟新 num_emtpy_slots=32，即所有槽位可用
+                        * 否则， 返回(bit位从右往左计)__ffs(~window)-1
+                    * 举例：
+                        1. window 按位表示
+                        `window = 11111111 11111111 11111111 11101111` ， 从右往左数（最右边是第 0 位）。 bit 4 是0，其他都是1 。注意, bit4 是 第5个槽位，因为 slots 是从1计数的。
+                        2. window 取反
+                        `~window = 00000000 00000000 00000000 00010000`
+                        3. __ffs(~window) 返回`~window` 从右往左，第一个为1的bit位置，可见是 bit 4。按slot计数，即 slot-5 
+                            * __ffs(~window)=5
+                        4. `__ffs(~window)-1`(4) : 即在原window中，从右往左数，前4个slot 已经被占据，但slot-5 为0，则可以释放前4个slot
+                    */
                     st_release_cta(rdma_send_channel_tail + lane_id, latest_tail + num_empty_slots);
-                    window >>= num_empty_slots;
+                    /*
+                        * rdma_send_channel_tail[lane_id] = latest_tail + num_empty_slots  ??
+                        * st_release_cta() ??
+                    */
+                    window >>= num_empty_slots;  // 滑窗右移 num_empty_slots 位，从而引入新的事务进入当前窗口
                 }
+                // 5. 跟新窗口状态并释放锁 
                 rdma_send_channel_window[lane_id] = window;
 
                 // Release lock
