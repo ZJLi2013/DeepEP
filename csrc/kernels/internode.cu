@@ -1078,13 +1078,14 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                     * 每个 lane_id(rdma_rank) 上一个自定义锁(int 变量)，在线程块内共享
 
                 * __shared__ int rdma_send_channel_tail[kNumRDMARanks]
+                * rdma_send_channel_tail ：  
                 */
                 // Acquire lock first
                 acquire_lock(rdma_send_channel_lock + lane_id);
                 /*
                     1. 当前lane-id 尝试获取 LDS 上 (rdma_send_channel_lock + lane_id) 地址的锁。获取成功后，进入下面临界区代码:                     
                 */                
-                auto latest_tail = rdma_send_channel_tail[lane_id]; // // TODO: 貌似rdma_send_channel_tail 看不到在哪里赋值的??
+                auto latest_tail = rdma_send_channel_tail[lane_id]; // 在`kRDMASenderCoordinator`中初始化
                 auto offset = rdma_tail_idx - latest_tail;
                 /*
                     2. 当前 lane-id 读取受保护变量 rdma_send_channel_tail[lane_id] 上的值，更新 offset 
@@ -1100,11 +1101,6 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                     latest_tail = rdma_send_channel_tail[lane_id]; 
                     offset = rdma_tail_idx - latest_tail;
                 }
-                /*
-                    TODO: latest_tail vs  rdma_tail_idx ??
-
-                */
-
                 // Release the transaction slot
                 // Add the bit and move the ones if possible
                 /*
@@ -1126,28 +1122,20 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 // 4. 滑动窗口(当处理最旧事务时)
                 if (offset == 0) {
                     /*
-                        offset==0, when processing the oldest outstanding transaction (the head of the window). 
-                        Its purpose is to reclaim buffer space by releasing contiguous free slots at the beginning of the window.
 
                     */
                     auto num_empty_slots = (~window) == 0 ? 32 : __ffs(~window) - 1;
                     /*
                         * ~window，反转位图
                         * (~window)==0 : 所有槽位都被占(反转前全1)，那么跟新 num_emtpy_slots=32，即所有槽位可用
-                        * 否则， 返回(bit位从右往左计)__ffs(~window)-1
-                    * 举例：
-                        1. window 按位表示
-                        `window = 11111111 11111111 11111111 11101111` ， 从右往左数（最右边是第 0 位）。 bit 4 是0，其他都是1 。注意, bit4 是 第5个槽位，因为 slots 是从1计数的。
-                        2. window 取反
-                        `~window = 00000000 00000000 00000000 00010000`
-                        3. __ffs(~window) 返回`~window` 从右往左，第一个为1的bit位置，可见是 bit 4。按slot计数，即 slot-5 
-                            * __ffs(~window)=5
-                        4. `__ffs(~window)-1`(4) : 即在原window中，从右往左数，前4个slot 已经被占据，但slot-5 为0，则可以释放前4个slot
+                        * 否则， 返回(bit位从右往左计，第一个为1的bit位置)： __ffs(~window)-1
                     */
                     st_release_cta(rdma_send_channel_tail + lane_id, latest_tail + num_empty_slots);
                     /*
-                        * rdma_send_channel_tail[lane_id] = latest_tail + num_empty_slots  ??
-                        * st_release_cta() ??
+                        使用 (latest_tail + num_empty_solts) 跟新  per  rdma_rank 对应的 rdma_send_channel_tail
+                        * st_release_cta() 以内存屏障(之前的写操作完成后，再执行该写操作) 执行如下:  
+                            * rdma_send_channel_tail[lane_id] = latest_tail + num_empty_slots
+                        * st_release_cta() 的意义就是保证写的顺序，并在warp内保证同步可见性
                     */
                     window >>= num_empty_slots;  // 滑窗右移 num_empty_slots 位，从而引入新的事务进入当前窗口
                 }
@@ -1172,7 +1160,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         // Clean shared memory
         EP_STATIC_ASSERT(kNumRDMARanks <= 32, "Invalid number of RDMA ranks");
         (lane_id < kNumRDMARanks) ? (rdma_send_channel_lock[lane_id] = 0) : 0;
-        (lane_id < kNumRDMARanks) ? (rdma_send_channel_tail[lane_id] = 0) : 0;
+        (lane_id < kNumRDMARanks) ? (rdma_send_channel_tail[lane_id] = 0) : 0;  // rdma_send_channel_tail 初始化
         (lane_id < kNumRDMARanks) ? (rdma_send_channel_window[lane_id] = 0) : 0;
 
         // Synchronize shared memory
@@ -1406,8 +1394,6 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             }
             /*
                 只使用lane0 做 buffer 判断，其他lanes 同步
-
-                TODO:   while(lane_id==0) 与接下来的 while(true) 配合 怎么理解 ??
             */
             __syncwarp();
 
